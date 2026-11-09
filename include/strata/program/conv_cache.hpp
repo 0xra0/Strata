@@ -40,6 +40,15 @@ inline size_t eviction_victim(const uint64_t* stamps, size_t n, int64_t cap) {
     return v;
 }
 
+// With an unpinned ordinary LRU cache already at capacity, an incoming checkpoint
+// has the newest stamp and cannot be its own victim. Recycle the same old victim
+// before capture so its large state vectors are overwritten instead of allocating
+// a seventh checkpoint and freeing one only afterwards. n means "not applicable".
+inline size_t reuse_before_capture(const uint64_t* stamps, size_t n, int64_t cap, bool ordinary) {
+    if (!ordinary || cap <= 0 || n != (size_t) cap || !n) return n;
+    return eviction_victim(stamps, n, cap);
+}
+
 /// --prompt-cache-tail: the extra checkpoint near the prompt's end (`tail[i]`) is the first to go - it serves
 /// only a branch of the last request - unless it is the newest item (the one just saved: `n > 1` and the newest
 /// stamp).  With no such item this is the plain policy.  Never the root.

@@ -1,0 +1,49 @@
+Long-context revision — 26 October 2026
+
+Observed target evidence from the supplied log, before this revision:
+  corrected ownership v2 active, no shadow restore in the latest run
+  prompt 62,133 tokens, generated 16,332 tokens
+  prefill 208.363 seconds, decode 1,350.830 seconds (12.1 tok/s)
+  complement in RAM 12.31 GiB of the required 15.34 GiB
+  67,020 MB storage reads during that request
+  roughly 0.95 GiB of the expert arena swapped out in the PID snapshot
+  no OOM observed by the user in this run
+
+New RAM policy fixture:
+  RAM working set: 12108 checks passed
+  static=4096 routed file reads
+  adaptive=512 routed file reads + 32 promotion reads
+  86.7% fewer logical expert reads in this constructed hot-set-shift trace
+  fixed 1,572,864-byte host arena, unchanged GPU owner table
+  every served expert compared byte-for-byte with the immutable source file
+  every resident expert checked after replacement; byte/move caps, equal-count
+  hysteresis, live GPU exclusion and non-finite counts also checked
+  AddressSanitizer + UndefinedBehaviorSanitizer passed (leak scanning disabled
+  for the host's tracing environment)
+
+CMake/CTest: 6/6 passed in 0.56 seconds
+  ram_working_set_test, idle_gpu_ownership_test, idle_gpu_shadows_test,
+  vision_records_test, conversation_memory_test, session_save_reclaim_test
+
+Python regression: 390 tests passed in 109.233 seconds
+  serve.test_server, serve.test_reasoning_policy, serve.test_effort_paths,
+  serve.test_reasoning_tools, serve.test_model_card_sampling,
+  tools.test_long_context_fix
+  Includes automatic reasoning wrap/answer, streaming, Responses, Anthropic,
+  explicit reasoning-budget precedence, existing APIs with the option off,
+  model/context/vision preservation, old-engine rejection, failed-build
+  preservation and binary/config backups.
+
+C++20 host syntax: src/program/generate.cpp passed with CUDA 12.9 headers.
+Python and shell syntax and git diff whitespace checks passed.
+
+Limits:
+  The RAM fixture uses actual file reads and host buffers to exercise the
+  production planner; it is not full-model inference or a target SSD benchmark.
+  No AMD GPU, ROCm/HIP compiler or target model is available here. A complete
+  HIP engine build and RX 6800 throughput/quality validation were not possible.
+  20 tok/s at long context is not established by these tests. Promotion overhead,
+  disk traffic, paging and decode timing must be compared on the target with the
+  same prompt/context and output/reasoning limits.
+  Shorter default thinking can affect difficult answers. Explicit budgets can
+  override it; model weights, sampling, context and answer capacity are retained.

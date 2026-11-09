@@ -107,7 +107,7 @@ def listen_problem(host: str, port: int, e: OSError) -> str:
     return f"cannot listen on {host}:{port}: {what} [{code}]. {hint}"
 
 
-def combined_embeddings_path(vision_dir: Path, nbytes: int) -> Path:
+def combined_embeddings_path(vision_dir: Path, nbytes: int, *, prefer_memory: bool = True) -> Path:
     """#874: where one request's combined image-embeddings file goes.  Every request with images rewrites it (it is
     deleted after the request), which on a disk is steady heavy writing: on Linux it goes to /dev/shm when that has
     room (the engine reads it back at once), on Windows the file is opened short-lived (the cache is not forced out
@@ -115,7 +115,7 @@ def combined_embeddings_path(vision_dir: Path, nbytes: int) -> Path:
     own directory, as before."""
     name = f"req-{uuid.uuid4().hex[:12]}.sve"
     shm = Path("/dev/shm")
-    if os.name != "nt" and shm.is_dir() and os.access(shm, os.W_OK):
+    if prefer_memory and os.name != "nt" and shm.is_dir() and os.access(shm, os.W_OK):
         try:
             if shutil.disk_usage(shm).free > 2 * nbytes + (16 << 20):
                 return shm / f"strata-vision-{os.getpid()}-{name}"
@@ -127,10 +127,20 @@ def combined_embeddings_path(vision_dir: Path, nbytes: int) -> Path:
 def write_temporary(path: Path, parts: list) -> None:
     """#874: write `parts` (files) one after the other into `path`; on Windows with FILE_ATTRIBUTE_TEMPORARY
     (os.O_SHORT_LIVED), so the file normally never reaches the drive before it is deleted."""
+    # Embedding cache files are immutable. A single image can share its inode with
+    # the request: no second file payload, and cache eviction cannot remove the
+    # request's link. Cross-filesystem links fall back to a bounded streaming copy.
+    if len(parts) == 1:
+        try:
+            os.link(parts[0], path)
+            return
+        except OSError:
+            pass
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0) | getattr(os, "O_SHORT_LIVED", 0)
     with os.fdopen(os.open(path, flags, 0o600), "wb") as f:
         for part in parts:
-            f.write(Path(part).read_bytes())
+            with Path(part).open("rb") as src:
+                shutil.copyfileobj(src, f, length=1 << 20)
 # #458: the trailing effort turn ("effort_position": "end"); low is the template's own sentence, medium (which the
 # template says nothing for: no xhigh sentence is medium there) says it, since the xhigh one stays at the top
 EFFORT_TURN = "<|im_start|>system\n{}<|im_end|>\n"
@@ -150,8 +160,9 @@ REPEAT_STOP_TOKENS = 256
 ANSWER_ROOM_MIN_CAP = 1024    # 0.1.45: from this max_tokens on, thinking without a budget is closed early enough to leave room to answer
 ANSWER_RESERVE_MIN = 512      # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
-# #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
-# and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
+# Opt-in reasoning_close_retry v2: a reasoning-only natural stop is continued once,
+# including a stop immediately after </think>. Calls already waiting for final
+# parsing are preserved. Another empty stop is an error rather than empty success.
 REASONING_CLOSE = "\n</think>\n\n"
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
@@ -339,6 +350,10 @@ class EngineNonFinite(ValueError):
     engine wrote none of that window's tokens and drops every cached state that may carry the poison, so its next
     request reads the prompt from token 0.  Service.run sends a request that had produced nothing yet once more, and
     ends one that had started (as "length").  A ValueError, so a stream that has started reports it as an error event."""
+
+
+class IncompleteAnswer(ValueError):
+    """The engine completed reasoning but supplied no answer after one bounded continuation; it is still running."""
 
 
 class SessionRefused(ValueError):
@@ -1008,6 +1023,11 @@ class StrataEngine:
         """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
         if getattr(self, "silent_note", None):          # #481: the server ended it, not the OS or the engine itself
             return self.silent_note
+        proc = self.proc
+        rc = proc.poll() if proc is not None else None
+        if os.name != "nt" and rc in (-signal.SIGINT, -signal.SIGTERM):
+            name = signal.Signals(-rc).name
+            return f"The engine was interrupted by {name}. This exit status does not indicate an out-of-memory kill."
         tail = wide = ""
         try:
             with open(self.log_path, "rb") as f:
@@ -1022,8 +1042,6 @@ class StrataEngine:
             if "issue #29" in line:
                 return ("The engine stopped itself because it had stopped making progress - a hang it caught. Its log "
                         "line: " + line.strip() + " - please report it at github.com/Niko1221/Strata/issues.")
-        proc = self.proc                                 # None while a restart has not started the next one yet
-        rc = proc.poll() if proc is not None else None
         if rc is not None and rc >= 0 and self.last_err:  # its own last words on stdout: they say why
             return (f"The engine exited (code {rc}) after it reported: {self.last_err} - please report it at "
                     "github.com/Niko1221/Strata/issues with the log.")
@@ -2277,12 +2295,18 @@ class Vision:
     sends the same picture again (every turn, with most clients) encodes it once."""
 
     @staticmethod
-    def work_dir() -> Path:
+    def work_dir(parent: str | None = None) -> Path:
         """#480: the directory for the encoder's files.  The engine reads the embeddings file named in a `GENI` line
         and the encoder the output named in an `ENC <image> <out>` line, both split at spaces, so a space in the path
         (a %TEMP% under a user name with a space) broke every image.  The system temp directory is used while its path
         has no space, then the working directory, then the system drive's root; the plain temp directory is the last
         resort (the encoder's own files are then named relative to it, see `_start`)."""
+        if parent is not None:
+            # An explicit SSD directory must not silently fall back to a RAM-backed /tmp.
+            parent = Path(parent).resolve()
+            if " " in str(parent):
+                raise ValueError("vision.work_dir must have no spaces (the engine's image protocol splits at spaces)")
+            return Path(tempfile.mkdtemp(prefix="strata-vision-", dir=parent))
         for parent in (None, Path.cwd(), Path(os.environ.get("SystemDrive", "C:") + os.sep)):
             try:
                 d = Path(tempfile.mkdtemp(prefix="strata-vision-", dir=parent))
@@ -2307,7 +2331,10 @@ class Vision:
             args += ["--max-tokens", str(cfg["max_tokens"])]
         if cfg.get("min_tokens"):                       # #767: mtmd's image_min_tokens (a hand-edited key)
             args += ["--min-tokens", str(cfg["min_tokens"])]
-        self.dir = self.work_dir()
+        if cfg.get("release_workspace") is True:
+            args.append("--release-workspace")
+        self.dir = self.work_dir(cfg["work_dir"]) if cfg.get("work_dir") else self.work_dir()
+        self.memory_efficient = cfg.get("memory_efficient") is True
         self.spawn = (args, log, env)                   # to start it again after an unload
         self.proc = None
         self.stopped = True
@@ -2532,7 +2559,17 @@ class Vision:
                 proc.wait(timeout=10)
             except (OSError, subprocess.TimeoutExpired):
                 pass
-        self.stopped = True
+        finally:
+            # A failed flush leaves buffered QUIT data in TextIOWrapper. Close it
+            # explicitly so its destructor cannot flush again and print BrokenPipeError.
+            for pipe in (getattr(proc, "stdin", None), getattr(proc, "stdout", None)):
+                close = getattr(pipe, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except (OSError, ValueError):
+                        pass
+            self.stopped = True
 
     def shutdown(self):
         """#914: close() for good: the server ends, so the encoder's directory (one ~10 MB .sve per image, on a tmpfs
@@ -3111,7 +3148,7 @@ class Service:
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
-        self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
+        self.reasoning_close_retry = False            # opt-in: finish a reasoning-only natural stop once
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
@@ -3181,6 +3218,7 @@ class Service:
         self.last_image_at = 0.0                         # when an image turn last ended (the elastic encoder's idle)
         self.reasoning_loop_recovery = False
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
+        self.reasoning_auto_budget_tokens = 0            # opt-in allowance independent of the context window
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
@@ -4042,7 +4080,8 @@ class Service:
             # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
             # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
             # one more for every retry of a 503.  run() deletes it; drop_embeddings() if run() never starts.
-            combined = combined_embeddings_path(self.vision.dir, sum(Path(p).stat().st_size for p, _ in encoded))
+            combined = combined_embeddings_path(self.vision.dir, sum(Path(p).stat().st_size for p, _ in encoded),
+                                                 prefer_memory=not getattr(self.vision, "memory_efficient", False))
             self.embeddings.path = combined             # first, so a half-written one is found as well
             # #2228: each picture's key is its normalized bytes' hash (the encoder's file name), so the engine's
             # conversation cache matches a picture by what it is, not by its embedding floats: a picture encoded again
@@ -4172,7 +4211,52 @@ class Service:
                      if s["phase"] == "thinking" and s.get("thinking_budget") else f"max {s.get('max_tokens')}")
             print(f"[strata] {s['phase']}: {s['generated']} of {limit} tokens, {rate:.1f} tok/s, "
                   f"{el:.0f} s", flush=True)
+        if getattr(self, "runtime_memory_log", False):
+            self._log_runtime_memory()
         return now
+
+    def _log_runtime_memory(self):
+        """At most once per ten seconds; record paging evidence while decode is stalled."""
+        from serve.runtime_memory import sample_runtime_memory
+        now = time.monotonic()
+        if now - getattr(self, "_memory_log_at", -10.0) < 10.0:
+            return
+        self._memory_log_at = now
+        proc = getattr(self.engine, "proc", None)
+        pid = getattr(proc, "pid", None)
+        if not isinstance(pid, int) or pid <= 0:
+            return
+        sample = sample_runtime_memory(pid)
+        if sample is None:
+            return
+        previous = getattr(self, "_memory_log_previous", None)
+        self._memory_log_previous = sample
+        if previous and previous["pid"] == pid:
+            for key in ("major_faults", "read_bytes"):
+                if key in previous and key in sample:
+                    sample[key + "_delta"] = max(0, sample[key] - previous[key])
+        line = "[strata] runtime memory: " + json.dumps(sample, separators=(",", ":"))
+        print(line, flush=True)
+        # Use the running engine's actual log, not another model's old coder log.
+        path = getattr(self.engine, "log_path", None)
+        if path:
+            try:
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except OSError:
+                pass
+
+    def _reasoning_completion_note(self, message):
+        """Keep a bounded, prompt-free recovery note beside the native DONE records."""
+        note = "[strata] reasoning-only completion: " + message
+        print(note, flush=True)
+        path = getattr(self.engine, "log_path", None)
+        if path:
+            try:
+                with open(path, "a", encoding="utf-8") as output:
+                    output.write(note + "\n")
+            except OSError:
+                pass
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
         """The request's events (see _run); with "prevent_sleep" in the config, the PC stays awake while it runs or waits."""
@@ -4196,6 +4280,13 @@ class Service:
             sampling = {**defaults, **req_values}
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
+        if thinking and budget is None and self.reasoning_auto_budget_tokens:
+            from serve.reasoning_policy import auto_reasoning_budget
+            budget = auto_reasoning_budget(self.reasoning_auto_budget_tokens, sampling,
+                                           self.reasoning_budget_tokens, self.effort_default())
+            if budget is not None:
+                print(f"[strata] default thinking allowance: {budget} tokens (reasoning_auto_budget_tokens; "
+                      "an explicit reasoning_budget_tokens takes precedence)", flush=True)
         if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
             # 0.1.45: max_tokens counts the thinking too.  A client that caps the reply at 8192 (the desktop agent's
             # harness sends max_completion_tokens: 8192 on every request) and a task the model thinks long about got
@@ -4323,6 +4414,10 @@ class Service:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
                                   max_tokens=max_new, reasoning_recoveries=0, thinking_budget=budget)
+                        if self.reasoning_close_retry:
+                            st["reasoning_answer_retries"] = 0
+                        else:
+                            st.pop("reasoning_answer_retries", None)
                         if par:
                             self.live_reqs[id(st)] = (st, rate)
                             self.status.update(st)
@@ -4381,7 +4476,7 @@ class Service:
                                 for ev in evs:
                                     if self.reasoning_loop_recovery and ev.kind == "reasoning":
                                         reasoning_text += ev.text or ""
-                                    if ev.kind in ("content", "tool_start", "tool_call"):
+                                    if (ev.kind == "content" and (ev.text or "").strip()) or ev.kind in ("tool_start", "tool_call"):
                                         answered = True
                                     yield "event", ev
                                 if evs:
@@ -4485,28 +4580,46 @@ class Service:
                                   f"(coverage={repeat_coverage:.3f}); resuming the same output with the low-effort "
                                   "instruction (reasoning_loop_recovery)", flush=True)
                             continue
-                        if (self.reasoning_close_retry and thinking and finish == "stop" and not close_retried
-                                and not answered and not wrap and not opens and parser.state == "reasoning"
-                                and parser.buf != THINK_END         # #537: not after a held </think>, the end
-                                and (stops is None or stops.hit is None) and not cancel.is_set()):
-                            # #1053: the model wrote its reasoning and stopped before </think>: the client would get
-                            # an empty answer.  Close the thinking once and let it answer.
+                        retry_suffix = None
+                        if parser.state == "reasoning":
+                            # A held end tag belongs to the model's output already:
+                            # a newline settles it; another </think> would be text.
+                            retry_suffix = "\n\n" if parser.buf == THINK_END else REASONING_CLOSE
+                        elif parser.state == "content" and not parser.buf.strip():
+                            retry_suffix = "\n" * (2 - (len(tail) - len(tail.rstrip("\n"))))
+                        if (self.reasoning_close_retry and thinking and thinking_n and finish == "stop"
+                                and not answered and not wrap and not opens and retry_suffix is not None
+                                and not any(call is not None for _, call in parser.pending)
+                                and (stops is None or (stops.hit is None and not stops.held.strip()))
+                                and not cancel.is_set()):
+                            if close_retried:
+                                finish = "error"
+                                self._reasoning_completion_note("no answer after one continuation; returning an error "
+                                                                "(reasoning_close_retry v2)")
+                                raise IncompleteAnswer("reasoning-only completion: the model supplied no answer or "
+                                                       "tool call after one continuation; the engine is still loaded")
+                            extra = self.tok.encode(retry_suffix + (force or ""), parse_special=True)
+                            if max_new - n - len(extra) < 1:
+                                finish = "length"       # honor the original cap; no hidden extra generation
+                                break
                             close_retried = True
-                            extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
-                            if max_new - n - len(extra) >= 1:
-                                print("[strata] the reply ended inside its thinking with no answer: closing the "
-                                      "thinking once and continuing (reasoning_close_retry)", flush=True)
-                                for t in extra:
-                                    n += 1
-                                    raw_ids.append(t)
-                                    thinking_n += parser.state in ("reasoning", "rcall")
-                                    evs = cut(parser.feed(detok.push(t)))
-                                    self._note(n, evs, st, rate)
-                                    for ev in evs:
-                                        yield "event", ev
-                                prompt = prompt + seg + extra
-                                finish = "length"
-                                continue
+                            force = None
+                            with self.status_lock:
+                                st["reasoning_answer_retries"] = 1
+                                st["thinking_budget"] = None
+                            self._reasoning_completion_note("continuing once to an answer or tool call "
+                                                            "(reasoning_close_retry v2)")
+                            for t in extra:
+                                n += 1
+                                raw_ids.append(t)
+                                thinking_n += parser.state in ("reasoning", "rcall")
+                                evs = cut(parser.feed(detok.push(t)))
+                                self._note(n, evs, st, rate)
+                                for ev in evs:
+                                    yield "event", ev
+                            prompt = prompt + seg + extra
+                            finish = "length"
+                            continue
                         if not (wrap or opens) or cancel.is_set():
                             break
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
@@ -4576,6 +4689,7 @@ class Service:
                                 # the request's whole prompt, and the tokens read of it (None: an older engine)
                                 "prompt_total": len(ids), "prompt_read": last.get("prompt_read"),
                                 "reasoning_recoveries": recovery_count,
+                                **({"reasoning_answer_retries": int(close_retried)} if self.reasoning_close_retry else {}),
                                 "reasoning_repeat_coverage": round(repeat_coverage, 3),
                                 "engine_generated": last.get("generated"),
                                 "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
@@ -4642,7 +4756,8 @@ class Service:
             yield "event", Event("content", stops.flush())     # the held tail was not a stop string after all
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
                 "timings": timings, "reasoning_tokens": thinking_n,
-                "reasoning_recoveries": recovery_count}
+                "reasoning_recoveries": recovery_count,
+                **({"reasoning_answer_retries": int(close_retried)} if self.reasoning_close_retry else {})}
         if stops is not None and stops.hit is not None:
             done["stop_sequence"] = stops.hit
         yield "done", done
@@ -5648,6 +5763,8 @@ def make_handler(svc: Service):
                     self._images(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
+            except IncompleteAnswer as e:
+                self._json(502, {"error": {"type": "server_error", "code": "reasoning_only_completion", "message": str(e)}})
             except EngineNonFinite as e:                    # #879, twice: not the request's fault
                 print(f"[strata] 503: {e}", flush=True)
                 self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
@@ -6057,6 +6174,8 @@ def make_handler(svc: Service):
                                                                 code="server_error"))
                 except EngineNonFinite as e:                 # #879, twice: not the request's fault
                     return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
+                except IncompleteAnswer as e:
+                    return self._json(502, responses_error_body(str(e), "server_error", code="reasoning_only_completion"))
                 except ValueError as e:                      # the engine's ERR line
                     return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
                 return self._json(200, result)
@@ -6951,7 +7070,10 @@ def main() -> int:
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
     svc.answer_room = cfg.get("answer_room") is not False
+    svc.runtime_memory_log = cfg.get("runtime_memory_log") is True
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+    if svc.reasoning_close_retry:
+        print("[strata] reasoning-only completion recovery enabled (reasoning_close_retry v2)", flush=True)
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
         icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                     if k in ("exe", "diffusion_model", "vae", "llm", "out_dir") and isinstance(v, str)
@@ -7058,6 +7180,13 @@ def main() -> int:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
+    if cfg.get("reasoning_auto_budget_tokens") is not None:
+        from serve.reasoning_policy import auto_reasoning_budget
+        try:
+            auto_reasoning_budget(cfg["reasoning_auto_budget_tokens"], {})
+        except ValueError as e:
+            raise SystemExit(f"[strata] config {e}")
+        svc.reasoning_auto_budget_tokens = cfg["reasoning_auto_budget_tokens"]
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         try:
             svc.reasoning_budget_tokens = cfg["reasoning_budget_tokens"]

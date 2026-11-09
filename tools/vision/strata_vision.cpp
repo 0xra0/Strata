@@ -18,6 +18,9 @@
 #include "llama.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#if defined(__linux__) && defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 #include <algorithm>
 #if !defined(_WIN32)
@@ -56,7 +59,7 @@ bool parse_enc(const std::string& line, std::string& img, std::string& out) {
 
 int main(int argc, char** argv) {
     std::string mmproj, model;
-    bool gpu = false;
+    bool gpu = false, release_workspace = false;
     int threads = 0, max_tokens = 0, min_tokens = 0;
     llama_flash_attn_type fa = LLAMA_FLASH_ATTN_TYPE_AUTO;
     bool fa_given = false;
@@ -67,8 +70,14 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
         if (a == "--mmproj") mmproj = next();
+        else if (a == "--help" || a == "-h") {
+            std::puts("strata-vision --mmproj FILE --model FILE [--gpu] [--threads N] [--max-tokens N] "
+                      "[--min-tokens N] [--flash-attn on|off|auto] [--release-workspace]");
+            return 0;
+        }
         else if (a == "--model") model = next();
         else if (a == "--gpu") gpu = true;
+        else if (a == "--release-workspace") release_workspace = true;
         else if (a == "--threads") threads = std::atoi(next().c_str());
         else if (a == "--max-tokens") max_tokens = std::atoi(next().c_str());
         else if (a == "--min-tokens") min_tokens = std::atoi(next().c_str());   // mtmd image_min_tokens (#767)
@@ -79,6 +88,10 @@ int main(int argc, char** argv) {
             fa_given = true;
         }
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
+    }
+    if (gpu && release_workspace) {
+        std::fprintf(stderr, "--release-workspace is for the CPU vision encoder\n");
+        return 2;
     }
     if (mmproj.empty() || model.empty()) {
         std::fprintf(stderr, "usage: strata-vision --mmproj <mmproj.gguf> --model <model.gguf> [--gpu] [--threads N] "
@@ -198,6 +211,7 @@ int main(int argc, char** argv) {
         mtmd_input_text txt{prompt.c_str(), prompt.size(), false, true};
         const mtmd_bitmap* bm[1] = {bw.bitmap};
         std::string err;
+        int encoded_n = 0, encoded_nx = 0, encoded_ny = 0;
         const mtmd_input_chunk* ichunk = nullptr;
         if (mtmd_tokenize(ctx, chunks, &txt, bm, 1) != 0) err = "the image could not be preprocessed";
         for (size_t c = 0; err.empty() && c < mtmd_input_chunks_size(chunks); ++c) {
@@ -222,15 +236,30 @@ int main(int argc, char** argv) {
                                 std::fwrite(embd, sizeof(float) * (size_t) n_embd, (size_t) n, f) == (size_t) n;
                 std::fclose(f);
                 if (!ok) err = "short write to " + out;
-                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-                if (ok) std::printf("OK %d %d %d %.0f\n", n, nx, ny, ms);
+                if (ok) {
+                    encoded_n = n; encoded_nx = nx; encoded_ny = ny;
+                }
             }
         }
-        if (!err.empty()) std::printf("ERR %s\n", err.c_str());
-        std::fflush(stdout);
         mtmd_input_chunks_free(chunks);
         mtmd_bitmap_free(bw.bitmap);
         if (bw.video_ctx) mtmd_helper_video_free(bw.video_ctx);
+        if (release_workspace) {
+            const size_t bytes = mtmd_release_cpu_vision_work_buffers(ctx);
+#if defined(__linux__) && defined(__GLIBC__)
+            if (bytes) malloc_trim(0);
+#endif
+            std::fprintf(stderr, "strata-vision: released %.1f MiB of CPU workspace; model weights retained\n",
+                         (double) bytes / (1 << 20));
+        }
+        // Publish only after scratch has been released. The engine may immediately
+        // restore its own host shadows and prefill when this acknowledgement arrives.
+        if (!err.empty()) std::printf("ERR %s\n", err.c_str());
+        else {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            std::printf("OK %d %d %d %.0f\n", encoded_n, encoded_nx, encoded_ny, ms);
+        }
+        std::fflush(stdout);
     }
     mtmd_free(ctx);
     llama_model_free(text);

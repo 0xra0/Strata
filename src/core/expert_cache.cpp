@@ -725,6 +725,29 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
     return true;
 }
 
+bool ExpertCache::copy_slot_to_host_blocking(int32_t slot, uint8_t* host_blob, std::string& err, int64_t bytes) const {
+    const auto* src = device_slot(slot);
+    if (!src || !host_blob || bytes <= 0 || bytes > blob_ || slot >= live_slots_ ||
+        bytes > bytes_of((int64_t) slot + 1) - bytes_of(slot)) {
+        err = "ExpertCache::copy_slot_to_host_blocking: invalid slot or blob bounds";
+        return false;
+    }
+    const size_t n = (size_t) bytes;
+#if defined(STRATA_USE_HIP)
+    if (!blocking_staging_ || n > blocking_staging_bytes_) {
+        err = "ExpertCache::copy_slot_to_host_blocking: HIP staging buffer is too small";
+        return false;
+    }
+    const cudaError_t e = cudaMemcpy(blocking_staging_, src, n, cudaMemcpyDeviceToHost);
+    if (e == cudaSuccess) std::memcpy(host_blob, blocking_staging_, n);
+#else
+    const cudaError_t e = cudaMemcpy(host_blob, src, n, cudaMemcpyDeviceToHost);
+#endif
+    if (e == cudaSuccess) return true;
+    err = std::string("ExpertCache::copy_slot_to_host_blocking: ") + cudaGetErrorString(e);
+    return false;
+}
+
 bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);

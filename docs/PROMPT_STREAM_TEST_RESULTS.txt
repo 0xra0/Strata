@@ -1,0 +1,62 @@
+Prompt stream revision, 2026-10-26
+
+Host: Linux 6.18.55, g++ 13, CPU only. No AMD GPU, HIP compiler, target GGUF
+or configured swap. Full HIP/CUDA/SYCL builds and real model inference were not
+available. Do not interpret these results as target speed or OOM validation.
+
+NEW READER
+268 checks passed. The test exercises all policy combinations of cached,
+RWF_DONTCACHE, O_DIRECT and buffered success/failure/unsupported results;
+capability suppression; overwrite after partial failed attempts; real immutable
+file bytes; three role slices in two shards; unaligned offsets and EOF;
+128 concurrent reads on eight workers; invalid range/descriptor guards;
+open/close and failed-open cleanup.
+
+Real file fixture: 8,388,746 bytes in three slices.
+  Cached pages before guarded reads: 0 bytes
+  Cached pages after guarded reads:  0 bytes
+  RWF_DONTCACHE:                     0 bytes
+  O_DIRECT:                         8,388,746 bytes
+  Buffered fallback:                0 bytes
+  Same slices with ordinary mapped copies: 13,635,584 cached bytes
+Both paths returned identical fixture bytes. These are file-cache observations
+on small synthetic fixtures, not real-model memory savings or token throughput.
+This filesystem returned EOPNOTSUPP for RWF_DONTCACHE, exercising the real
+O_DIRECT fallback. Successful RWF_DONTCACHE syscall behavior was not measured;
+its policy success branch was exercised with injected results.
+
+AddressSanitizer + UndefinedBehaviorSanitizer: 268 checks passed, no findings.
+Leak scanning disabled because the tracing host prevents LSan operation.
+New test also compiles with -Wall -Wextra -Werror.
+
+CPU REGRESSIONS
+8 selected standalone CTests passed (1.12 s):
+  vision_records_test, idle_gpu_shadows_test, idle_gpu_ownership_test,
+  ram_working_set_test, resident_readahead_test, prompt_file_reader_test,
+  conversation_memory_test, session_save_reclaim_test.
+This is the selected relevant set, not the entire engine test suite.
+
+42 Python tests passed (3.659 s):
+  tools.test_prompt_stream_fix, tools.test_swap_prefetch_fix,
+  tools.test_long_context_fix, serve.test_reasoning_policy,
+  serve.test_resident_recovery.
+New installer/config tests use fake cmake and executable fixtures. They verify
+the exact profile delta, backups, opt-outs, preserving thinking/vision/args,
+and leaving the installed engine intact on build or marker-check failure.
+HTTP tests mock transport responses; the user's real translation calls are
+evidence from the attached log only. Existing telemetry ResourceWarnings were
+emitted by the Python suite; no test failed.
+
+INTEGRATION
+generate.cpp and expert_source.cpp passed host C++20 syntax with real CUDA 12.9
+headers, zero diagnostics (STRATA_VERSION=0.1.45). This checks the edited call
+sites/types, not HIP device compilation or runtime behavior.
+Shell/Python syntax checked. The delivered delta applies to full-project
+version 6 and reconstructs each changed source exactly. Archive contents are
+verified against an explicit file list, retaining unrelated full-archive data.
+
+REMAINING TARGET VALIDATION
+Compare the same Zed task/prompt on the same RX 6800 and model. Keep all inference
+settings unchanged. Record cold and warm prefill, decode, VmSwap, file reader
+MiB categories and process I/O. Verify answer quality on representative tasks.
+No guaranteed 20-25 tok/s or universal OOM prevention is claimed.

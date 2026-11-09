@@ -24,6 +24,9 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/core/exchange_storage.hpp"
+#include "strata/core/idle_gpu_shadows.hpp"
+#include "strata/core/resident_readahead.hpp"
+#include "strata/core/prompt_file_reader.hpp"
 #include "strata/core/hit_hook.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 
@@ -701,6 +704,16 @@ public:
     bool complement_pinned() const { return complement_pinned_; }
     bool complement_ready() const { return complement_ready_; }
     uint64_t locked_bytes() const { return complement_locked_; }
+    /// --serve, single GPU only, between requests after all copies/adaptation have
+    /// drained. Release only pageable host duplicates of experts still in cache.
+    /// Restore before any command can lend, evict or read those experts. Both
+    /// calls require the serve loop's live residency, not the startup profile.
+    bool release_idle_gpu_shadows(ExpertCache& cache, const std::vector<int32_t>& live_residency,
+                                  size_t& bytes, std::string& err,
+                                  bool refresh_gpu = false);
+    bool restore_idle_gpu_shadows(const ExpertCache& cache, const std::vector<int32_t>& live_residency,
+                                  std::string& err);
+    size_t idle_gpu_shadow_bytes() const { return idle_shadows_.released_bytes(); }
     /// Lend-region slots whose experts the compact copy holds (the last ones of the cache).
     int64_t resident_lent_slots() const { return complement_lent_slots_; }
 
@@ -770,6 +783,7 @@ public:
     /// the time spent reading the files, summed over threads.
     uint64_t file_blob_bytes() const { return file_blob_bytes_.load(std::memory_order_relaxed); }
     double file_ms() const { return (double) file_us_.load(std::memory_order_relaxed) / 1000.0; }
+    detail::ResidentReadAheadStats resident_readahead_stats() const { return resident_readahead_.stats(); }
     /// Threads `prefetch` reads the GGUF with (STRATA_FETCH_THREADS, default 8).
     void set_fetch_threads(int n) { fetch_threads_ = n < 1 ? 1 : n; }
     /// #286: read the experts straight from the drive (Windows: FILE_FLAG_NO_BUFFERING, overlapped; Linux: O_DIRECT and
@@ -788,6 +802,9 @@ public:
     /// decode's choice: re-routed experts come back from it), the prompt path's batched stager reads (copy_blobs) go
     /// unbuffered instead - the same bytes, read in merged O_DIRECT requests.  False when not opened (and why).
     bool open_prompt_direct(std::string& why);
+    /// Opt-in Linux prompt reads: reuse hot file spans, bypass cache for cold spans.
+    bool open_prompt_stream(std::string& why);
+    detail::PromptReadStats prompt_stream_stats() const { return prompt_reader_.stats(); }
     /// pp-opt (Windows, experts.bin, unbuffered): close the mapped view once startup no longer needs it.  NTFS runs
     /// the unbuffered reads of a mapped file one at a time - on a PCIe 4 NVMe (WD SN580) 2 MiB reads at queue depth
     /// 32 measured 2.35 GB/s with experts.bin mapped and 3.57 GB/s without.  After this every file read goes through
@@ -939,6 +956,8 @@ private:
     std::condition_variable stage_cv_;
     int fetch_threads_ = 8;
     std::atomic<uint64_t> file_blob_bytes_{0}, file_us_{0};
+    detail::ResidentReadAhead resident_readahead_;
+    detail::PromptFileReader prompt_reader_;
     std::unique_ptr<std::atomic<uint32_t>[]> warm_stamp_;   ///< per (layer, expert): epoch_ + 1 when warmed
     std::atomic<int64_t> warm_hits_{0}, warm_count_{0};
     mutable std::atomic<int64_t> direct_fallbacks_{0};
@@ -993,6 +1012,7 @@ private:
     uint64_t mapped_bytes_ = 0;
     std::vector<uint64_t> layer_offsets_, layer_blob_bytes_;
     void* complement_arena_ = nullptr;
+    detail::IdleGpuShadows idle_shadows_;
     const uint8_t* complement_host_ = nullptr;
     const uint8_t* complement_device_ = nullptr;
     uint64_t complement_bytes_ = 0;

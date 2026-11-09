@@ -1,0 +1,45 @@
+Resident swap read-ahead — 26 October 2026
+
+User-supplied controlled request:
+  correct translation: Hi! How are you doing?
+  prompt 33 tokens, completion 8 tokens, stop
+  native prefill 6,308.6 ms, native decode 2,084.6 ms (3.8 tok/s)
+  server window: 8 tokens in 8 seconds, decode cache hit 43.9%
+  VmSwap 8,724,204 KiB = 8.32 GiB, MemAvailable about 7.65 GiB
+  the second curl paste contained no response/status to establish its cause
+
+Specific code gap: FileExpertSource::warm skipped every host-complement expert,
+even though pageable anonymous expert bytes can be swapped out. The new option
+uses the existing CPU routing lookahead to issue guarded read-ahead requests.
+
+New helper tests:
+  resident read-ahead: 100 checks passed
+  actual file fixture: 512 cold pages; 2.0 MiB MADV_WILLNEED hints; exact bytes
+  retained after read-ahead; actual mincore and zero-swap path exercised
+  injected tests cover 128 MiB/100 ms requested-range budget, 2,560 MiB memory
+  floor, within-period memory reservations, unknown/failed probes, error-rate
+  bounding, page alignment, invalid/overflowed ranges, eight-call fragmentation
+  cap and the once-per-second zero-swap fast path
+  AddressSanitizer and UndefinedBehaviorSanitizer passed; leak scanning disabled
+  for the host tracing environment
+
+CMake/CTest: 7/7 passed
+  resident_readahead_test, ram_working_set_test, idle_gpu_ownership_test,
+  idle_gpu_shadows_test, vision_records_test, conversation_memory_test,
+  session_save_reclaim_test
+
+Python: 33 tests passed in 3.507 seconds
+  tools.test_swap_prefetch_fix, tools.test_long_context_fix,
+  serve.test_reasoning_policy, serve.test_resident_recovery
+  Includes old-binary rejection, failed-build preservation, backups, preservation
+  of model/memory/vision/thinking settings, explicit opt-outs, HTTP status/body
+  capture, empty-body detection and exact Unicode in isolated test requests.
+
+Host C++20 syntax: generate.cpp and expert_source.cpp passed using CUDA 12.9
+headers, zero diagnostics. Shell/Python syntax and whitespace checks passed.
+
+Limits: this host has no configured swap, AMD GPU, ROCm compiler or target model.
+The file fixture is not an anonymous swap benchmark. No full HIP/CUDA engine
+build, target paging-latency measurement or model throughput/quality validation
+was performed. Advised bytes are requested ranges, not measured restored RAM
+or exact physical I/O. Read-ahead cannot pin memory or guarantee zero swap.

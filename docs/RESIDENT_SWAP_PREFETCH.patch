@@ -1,0 +1,764 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -125,6 +125,9 @@
+   add_executable(ram_working_set_test tests/program/ram_working_set_test.cpp)
+   target_include_directories(ram_working_set_test PRIVATE include)
+   add_test(NAME ram_working_set_test COMMAND ram_working_set_test)
++  add_executable(resident_readahead_test tests/core/resident_readahead_test.cpp)
++  target_include_directories(resident_readahead_test PRIVATE include)
++  add_test(NAME resident_readahead_test COMMAND resident_readahead_test)
+ endif()
+ # #2027: defined here, before the GPU section reads it to register the native-expert tests (it was defined at the
+ # native-experts section far below, so a first configure registered four tests fewer than the second)
+--- /dev/null
++++ b/include/strata/core/resident_readahead.hpp
+@@ -0,0 +1,121 @@
++// Read-ahead of predicted pageable RAM experts, from the routing lookahead worker.
++// This never reads/writes expert values and never locks or discards their pages.
++#pragma once
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <limits>
++#include <vector>
++#if defined(__linux__)
++#include <sys/mman.h>
++#include <unistd.h>
++#endif
++
++namespace strata::core::detail {
++struct ResidentReadAheadStats {
++    uint64_t probes, advised_bytes, errors, budget_skips, pressure_skips, unknown_skips, no_swap_skips, microseconds;
++};
++
++class ResidentSwapGate {
++public:
++    template<class ReadSwap>
++    bool active(uint64_t now, ReadSwap read) {
++        if (!sampled_ || now < sampled_at_ || now - sampled_at_ >= 1000000) {
++            sampled_ = true; sampled_at_ = now; known_ = read(bytes_);
++        }
++        return !known_ || bytes_ > 0;
++    }
++private:
++    uint64_t sampled_at_ = 0, bytes_ = 0;
++    bool sampled_ = false, known_ = false;
++};
++
++class ResidentReadAhead {
++public:
++    static constexpr uint64_t kPeriodUs = 100000, kBudget = 128ull << 20, kFloor = 2560ull << 20;
++    static constexpr size_t kMaxBlob = 8u << 20, kMaxRuns = 8;
++
++    ResidentReadAheadStats stats() const {
++        return {probes_.load(), advised_.load(), errors_.load(), budget_skips_.load(),
++                pressure_skips_.load(), unknown_skips_.load(), no_swap_skips_.load(), microseconds_.load()};
++    }
++
++    // Called by one worker only. Readers of stats() may run concurrently. Callback
++    // injection tests the exact production selection/pressure/budget path without swap.
++    template<class Probe, class Advise, class Available>
++    void hint_with(const uint8_t* ptr, size_t bytes, size_t page, uint64_t now,
++                   Probe probe, Advise advise, Available available) {
++        if (!ptr || !bytes || bytes > kMaxBlob || !page) return;
++        const uintptr_t p = (uintptr_t) ptr, limit = (std::numeric_limits<uintptr_t>::max)();
++        if (bytes > limit - p) return;
++        const uintptr_t start = p - p % page, end = p + bytes;
++        const size_t tail = end % page ? page - end % page : 0;
++        if (tail > limit - end) return;
++        const size_t length = (size_t) (end + tail - start), pages = length / page;
++        bits_.resize(pages);
++        ++probes_;
++        if (!probe((const void*) start, length, bits_.data())) { ++errors_; return; }
++        if (std::all_of(bits_.begin(), bits_.end(), [](auto b) { return (b & 1) != 0; })) return;
++        if (!period_set_ || now < period_at_ || now - period_at_ >= kPeriodUs) {
++            period_set_ = true; period_at_ = now; used_ = 0;
++            memory_known_ = available(remaining_);
++        }
++        if (!memory_known_) { ++unknown_skips_; return; }
++        size_t runs = 0;
++        for (size_t i = 0; i < pages && runs < kMaxRuns;) {
++            if (bits_[i] & 1) { ++i; continue; }
++            const size_t first = i++;
++            while (i < pages && !(bits_[i] & 1)) ++i;
++            const size_t n = (i - first) * page;
++            if (n > kBudget - used_) { ++budget_skips_; return; }
++            if (remaining_ <= kFloor || n > remaining_ - kFloor) { ++pressure_skips_; return; }
++            // Reserve even when the hint fails; repeated failures must stay bounded.
++            used_ += n; remaining_ -= n; ++runs;
++            if (advise((const void*) (start + first * page), n)) advised_ += n;
++            else ++errors_;
++        }
++    }
++
++    template<class Available>
++    void hint(const uint8_t* ptr, size_t bytes, Available available) {
++#if defined(__linux__)
++        const auto t0 = std::chrono::steady_clock::now();
++        const auto now = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t0.time_since_epoch()).count();
++        // Healthy runs do not need a mincore syscall per expert. Sample VmSwap
++        // once per second; unknown swap status retains the guarded probe path.
++        if (!swap_gate_.active(now, [](uint64_t& bytes) {
++            FILE* f = std::fopen("/proc/self/status", "r");
++            if (!f) return false;
++            char line[256]; unsigned long long kib = 0; bool found = false;
++            while (std::fgets(line, sizeof line, f))
++                if (std::sscanf(line, "VmSwap: %llu kB", &kib) == 1) { found = true; break; }
++            std::fclose(f);
++            if (!found || kib > (std::numeric_limits<uint64_t>::max)() / 1024) return false;
++            bytes = (uint64_t) kib * 1024; return true;
++        })) {
++            ++no_swap_skips_;
++            return;
++        }
++        static const long page = sysconf(_SC_PAGESIZE);
++        if (page <= 0) return;
++        hint_with(ptr, bytes, (size_t) page, now,
++                  [](const void* p, size_t n, unsigned char* b) { return mincore((void*) p, n, b) == 0; },
++                  [](const void* p, size_t n) { return madvise((void*) p, n, MADV_WILLNEED) == 0; }, available);
++        microseconds_ += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
++                            std::chrono::steady_clock::now() - t0).count();
++#else
++        (void) ptr; (void) bytes; (void) available;
++#endif
++    }
++private:
++    std::vector<unsigned char> bits_;
++    ResidentSwapGate swap_gate_;
++    uint64_t period_at_ = 0, used_ = 0, remaining_ = 0;
++    bool period_set_ = false, memory_known_ = false;
++    std::atomic<uint64_t> probes_{0}, advised_{0}, errors_{0}, budget_skips_{0}, pressure_skips_{0},
++                          unknown_skips_{0}, no_swap_skips_{0}, microseconds_{0};
++};
++} // namespace strata::core::detail
+--- a/include/strata/core/expert_source.hpp
++++ b/include/strata/core/expert_source.hpp
+@@ -25,6 +25,7 @@
+ #include "strata/core/pinned.hpp"
+ #include "strata/core/exchange_storage.hpp"
+ #include "strata/core/idle_gpu_shadows.hpp"
++#include "strata/core/resident_readahead.hpp"
+ #include "strata/core/hit_hook.hpp"
+ #include "strata/kernels/cpu/pool.hpp"
+ 
+@@ -781,6 +782,7 @@
+     /// the time spent reading the files, summed over threads.
+     uint64_t file_blob_bytes() const { return file_blob_bytes_.load(std::memory_order_relaxed); }
+     double file_ms() const { return (double) file_us_.load(std::memory_order_relaxed) / 1000.0; }
++    detail::ResidentReadAheadStats resident_readahead_stats() const { return resident_readahead_.stats(); }
+     /// Threads `prefetch` reads the GGUF with (STRATA_FETCH_THREADS, default 8).
+     void set_fetch_threads(int n) { fetch_threads_ = n < 1 ? 1 : n; }
+     /// #286: read the experts straight from the drive (Windows: FILE_FLAG_NO_BUFFERING, overlapped; Linux: O_DIRECT and
+@@ -950,6 +952,7 @@
+     std::condition_variable stage_cv_;
+     int fetch_threads_ = 8;
+     std::atomic<uint64_t> file_blob_bytes_{0}, file_us_{0};
++    detail::ResidentReadAhead resident_readahead_;
+     std::unique_ptr<std::atomic<uint32_t>[]> warm_stamp_;   ///< per (layer, expert): epoch_ + 1 when warmed
+     std::atomic<int64_t> warm_hits_{0}, warm_count_{0};
+     mutable std::atomic<int64_t> direct_fallbacks_{0};
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -2177,8 +2177,27 @@
+         const int64_t e = experts[j];
+         if (e < 0 || e >= n_expert_) continue;
+         const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) e;
+-        if (complement_ready_ && resident_blob(index) != nullptr)
+-            continue;                                                    // in the RAM copy
++        if (complement_ready_) {
++            if (const uint8_t* ram = resident_blob(index)) {
++#if defined(__linux__)
++                static const bool swap_ahead = [] {
++                    const char* v = std::getenv("STRATA_RESIDENT_SWAP_PREFETCH");
++                    return v && std::atoi(v) != 0;
++                }();
++                // Allocation in the host tier does not imply physical residency:
++                // Linux can swap the pageable complement during idle periods.
++                // The existing lookahead worker requests only predicted CPU rows.
++                if (swap_ahead && !complement_pinned_ && !complement_registered_ && !complement_locked_)
++                    resident_readahead_.hint(ram, (size_t) layer_blob_bytes_[(size_t) layer], [](uint64_t& free) {
++                        uint64_t commit = 0;
++                        if (!available_memory_bytes(free, &commit)) return false;
++                        free = std::min(free, commit);
++                        return true;
++                    });
++#endif
++                continue;
++            }
++        }
+         if (warm_stamp_) warm_stamp_[index].store(stamp, std::memory_order_relaxed);
+         warm_count_.fetch_add(1, std::memory_order_relaxed);
+         if (io_pf_ && direct_.empty()) {   // read it ahead with pread on the I/O threads (instead of an madvise hint)
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -14908,6 +14908,17 @@
+             if (src.ram_adapts() > 0)   // STRATA_RAM_ADAPT, cumulative
+                 std::fprintf(stderr, "strata serve: resident RAM: %lld experts moved in from the file in place of "
+                                      "unused ones (STRATA_RAM_ADAPT)\n", (long long) src.ram_adapts());
++            if ([] { const char* v = std::getenv("STRATA_RESIDENT_SWAP_PREFETCH"); return v && std::atoi(v); }()) {
++                const auto st = src.resident_readahead_stats();
++                std::fprintf(stderr, "strata serve: resident swap prefetch v1: %llu probes, %.1f MiB read-ahead hints, "
++                                     "%llu errors, %llu budget skips, %llu pressure skips, %llu unknown-memory skips, %llu zero-swap skips; "
++                                     "%.1f ms in the lookahead worker (cumulative; hints do not lock RAM)\n",
++                             (unsigned long long) st.probes, (double) st.advised_bytes / (1 << 20),
++                             (unsigned long long) st.errors, (unsigned long long) st.budget_skips,
++                             (unsigned long long) st.pressure_skips, (unsigned long long) st.unknown_skips,
++                             (unsigned long long) st.no_swap_skips,
++                             (double) st.microseconds / 1000.0);
++            }
+             if (ajob)   // --adapt-async, cumulative (a round may still be in flight: it lands before the next request)
+                 std::fprintf(stderr, "strata serve: asynchronous adaptive tier: %lld rounds, %lld experts swapped in, "
+                                      "%.1f ms per round (start to flip, between windows)",
+--- /dev/null
++++ b/tests/core/resident_readahead_test.cpp
+@@ -0,0 +1,109 @@
++#include "strata/core/resident_readahead.hpp"
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fcntl.h>
++#include <sys/stat.h>
++
++using strata::core::detail::ResidentReadAhead;
++static int checks = 0;
++static void check(bool ok, const char* why) {
++    ++checks;
++    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", why); std::exit(1); }
++}
++int main() {
++    constexpr size_t page = 4096, blob = 2u << 20;
++    auto* fake = (const uint8_t*) 0x100000;
++    strata::core::detail::ResidentSwapGate swap_gate;
++    size_t swap_reads = 0;
++    auto none = [&](uint64_t& n) { ++swap_reads; n = 0; return true; };
++    check(!swap_gate.active(1, none) && !swap_gate.active(999999, none) && swap_reads == 1, "zero-swap fast path caches its sample for one second");
++    check(swap_gate.active(1000001, [&](uint64_t& n) { ++swap_reads; n = 8ull << 30; return true; }), "swapped process enables page probes");
++    check(swap_gate.active(1000002, none) && swap_reads == 2, "swap state does not read proc for every expert");
++    check(swap_gate.active(2000001, [](uint64_t&) { return false; }), "unknown swap status retains guarded page probes");
++    auto plenty = [](uint64_t& n) { n = 1ull << 40; return true; };
++    auto cold = [](const void*, size_t n, unsigned char* b) { std::memset(b, 0, n / page); return true; };
++    auto hot = [](const void*, size_t n, unsigned char* b) { std::memset(b, 1, n / page); return true; };
++    size_t calls = 0, advised = 0;
++    auto advise = [&](const void* p, size_t n) {
++        check((uintptr_t) p % page == 0 && n % page == 0, "only page-aligned read-ahead ranges");
++        ++calls; advised += n; return true;
++    };
++    ResidentReadAhead warm;
++    warm.hint_with(fake, blob, page, 1, hot, advise, plenty);
++    check(!calls && warm.stats().probes == 1, "already resident pages require no advice");
++    ResidentReadAhead limit;
++    for (int i = 0; i < 65; ++i) limit.hint_with(fake, blob, page, 1, cold, advise, plenty);
++    check(calls == 64 && advised == ResidentReadAhead::kBudget, "128 MiB period limit is exact");
++    check(limit.stats().budget_skips == 1, "excess read-ahead is skipped");
++    limit.hint_with(fake, blob, page, 1 + ResidentReadAhead::kPeriodUs, cold, advise, plenty);
++    check(calls == 65, "budget resets after 100 ms");
++
++    ResidentReadAhead pressure;
++    auto low = [](uint64_t& n) { n = ResidentReadAhead::kFloor + page - 1; return true; };
++    const size_t old_calls = calls;
++    pressure.hint_with(fake, page, page, 1, cold, advise, low);
++    check(calls == old_calls && pressure.stats().pressure_skips == 1, "do not consume the free-memory floor");
++    ResidentReadAhead unknown;
++    unknown.hint_with(fake, page, page, 1, cold, advise, [](uint64_t&) { return false; });
++    check(calls == old_calls && unknown.stats().unknown_skips == 1, "unknown memory declines prefetch");
++    ResidentReadAhead reservation;
++    auto tight = [](uint64_t& n) { n = ResidentReadAhead::kFloor + 2 * page; return true; };
++    reservation.hint_with(fake, page, page, 1, cold, advise, tight);
++    reservation.hint_with(fake, 2 * page, page, 2, cold, advise, tight);
++    check(reservation.stats().pressure_skips == 1, "admitted hints reserve their memory within the period");
++
++    ResidentReadAhead failed;
++    size_t attempts = 0;
++    for (int i = 0; i < 65; ++i)
++        failed.hint_with(fake, blob, page, 1, cold, [&](const void*, size_t) { ++attempts; return false; }, plenty);
++    check(attempts == 64 && failed.stats().errors == 64 && failed.stats().budget_skips == 1, "failures cannot bypass I/O limit");
++    ResidentReadAhead bad_probe;
++    bad_probe.hint_with(fake, page, page, 1, [](const void*, size_t, unsigned char*) { return false; }, advise, plenty);
++    check(bad_probe.stats().errors == 1 && bad_probe.stats().advised_bytes == 0, "failed residency probe does not guess");
++    ResidentReadAhead geometry;
++    geometry.hint_with(fake + 1, page, page, 1, cold, advise, plenty);
++    check(geometry.stats().advised_bytes == 2 * page, "unaligned expert boundaries cover the correct pages");
++    geometry.hint_with((const uint8_t*) (UINTPTR_MAX - 2), 8, page, 1, cold, advise, plenty);
++    geometry.hint_with(nullptr, page, page, 1, cold, advise, plenty);
++    check(geometry.stats().probes == 1, "invalid bounds rejected before probe");
++    ResidentReadAhead fragmented;
++    fragmented.hint_with(fake, 32 * page, page, 1, [](const void*, size_t n, unsigned char* b) {
++        for (size_t i = 0; i < n / page; ++i) b[i] = (unsigned char) (i % 2);
++        return true;
++    }, advise, plenty);
++    check(fragmented.stats().advised_bytes == 8 * page, "fragmented cold ranges cap at eight syscalls per expert");
++
++    // The host has no swap configured. Exercise actual mincore/MADV_WILLNEED on
++    // an anonymous warm allocation and a read-only file mapping, not fake swap.
++    const size_t real_page = (size_t) sysconf(_SC_PAGESIZE), real_size = 2u << 20;
++    auto* anon = (uint8_t*) mmap(nullptr, real_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    check(anon != MAP_FAILED, "allocate anonymous expert fixture");
++    for (size_t i = 0; i < real_size; ++i) anon[i] = (uint8_t) (i * 31 + (i >> 10));
++    ResidentReadAhead resident;
++    resident.hint(anon + 7, real_size - 14, plenty);
++    check(resident.stats().advised_bytes == 0 && (resident.stats().no_swap_skips == 1 || resident.stats().probes == 1),
++          "actual hot/zero-swap path issues no read-ahead");
++    char name[] = "/tmp/strata-read-ahead-XXXXXX";
++    const int fd = mkstemp(name); check(fd >= 0, "create immutable file fixture"); unlink(name);
++    check(write(fd, anon, real_size) == (ssize_t) real_size && fsync(fd) == 0, "write exact fixture bytes");
++    const auto* mapping = (const uint8_t*) mmap(nullptr, real_size, PROT_READ, MAP_SHARED, fd, 0);
++    check(mapping != MAP_FAILED, "map read-only expert fixture");
++    (void) madvise((void*) mapping, real_size, MADV_DONTNEED); // tests only: read-only file pages, never anonymous weights
++    (void) posix_fadvise(fd, 0, (off_t) real_size, POSIX_FADV_DONTNEED);
++    std::vector<unsigned char> bits(real_size / real_page);
++    check(mincore((void*) mapping, real_size, bits.data()) == 0, "observe real file residency");
++    const size_t cold_pages = (size_t) std::count_if(bits.begin(), bits.end(), [](auto b) { return !(b & 1); });
++    ResidentReadAhead actual;
++    actual.hint_with(mapping, real_size, real_page, 1,
++        [](const void* p, size_t n, unsigned char* b) { return mincore((void*) p, n, b) == 0; },
++        [](const void* p, size_t n) { return madvise((void*) p, n, MADV_WILLNEED) == 0; }, plenty);
++    check(actual.stats().errors == 0, "actual read-ahead system call succeeds");
++    if (cold_pages) check(actual.stats().advised_bytes > 0, "cold file pages exercise the production hint path");
++    check(std::memcmp(mapping, anon, real_size) == 0, "read-ahead preserves every expert byte");
++    for (size_t i = 0; i < real_size; ++i)
++        if (anon[i] != (uint8_t) (i * 31 + (i >> 10))) { check(false, "anonymous weights changed"); }
++    std::printf("resident read-ahead: %d checks passed; real file cold pages=%zu, %.1f MiB hints; exact bytes retained; host swap unavailable\n",
++                checks, cold_pages, (double) actual.stats().advised_bytes / (1 << 20));
++    munmap((void*) mapping, real_size); munmap(anon, real_size); close(fd);
++}
+--- /dev/null
++++ b/tools/configure_swap_prefetch.py
+@@ -0,0 +1,54 @@
++#!/usr/bin/env python3
++"""Enable bounded resident swap read-ahead after building its matching engine."""
++import argparse
++import copy
++import json
++import os
++from pathlib import Path
++import shutil
++import tempfile
++import time
++
++
++def configure(path):
++    path = Path(path).resolve()
++    before = json.loads(path.read_text())
++    if '--resident-experts' not in before.get('args', []):
++        raise ValueError('Resident swap prefetch requires the existing --resident-experts mode')
++    exe = Path(before['exe'])
++    if not exe.is_absolute(): exe = Path(before.get('cwd') or path.parent) / exe
++    code = exe.read_bytes()
++    for marker in (b'idle GPU shadows: live ownership v2', b'resident swap prefetch v1', b'STRATA_RESIDENT_SWAP_PREFETCH'):
++        if marker not in code: raise ValueError('Build the swap-prefetch engine before enabling this profile')
++    after = copy.deepcopy(before)
++    if after.get('env') is None: after['env'] = {}
++    if not isinstance(after['env'], dict): raise ValueError('The config env must be an object')
++    after['env'].setdefault('STRATA_RESIDENT_SWAP_PREFETCH', '1')
++    after['runtime_memory_log'] = True
++    assert after['args'] == before['args']
++    backup = path.with_name(path.name + '.before-swap-prefetch-' + str(time.time_ns()))
++    shutil.copy2(path, backup)
++    fd, temp = tempfile.mkstemp(prefix='.strata-swap-prefetch-', dir=path.parent)
++    try:
++        with os.fdopen(fd, 'w') as f:
++            json.dump(after, f, indent=2); f.write('\n'); f.flush(); os.fsync(f.fileno())
++        shutil.copymode(path, temp)
++        os.replace(temp, path)
++    finally:
++        Path(temp).unlink(missing_ok=True)
++    return after, backup
++
++
++if __name__ == '__main__':
++    p = argparse.ArgumentParser(description=__doc__)
++    p.add_argument('--config', type=Path, default=Path(__file__).resolve().parents[1] / 'strata-coder-uncen-iq1_m.json')
++    args = p.parse_args()
++    try:
++        config, backup = configure(args.config)
++    except (OSError, ValueError, KeyError) as e: p.exit(1, str(e) + '\n')
++    print('Resident swap-prefetch profile saved. Model, memory, thinking and vision settings preserved.')
++    print('Config backup:', backup)
++    if config['env'].get('STRATA_LOOKAHEAD') == '0':
++        print('STRATA_LOOKAHEAD=0 is preserved; resident read-ahead cannot run while its worker is disabled.')
++    if config['env'].get('STRATA_RESIDENT_SWAP_PREFETCH') == '0':
++        print('An explicit STRATA_RESIDENT_SWAP_PREFETCH=0 was preserved; the new policy is disabled.')
+--- /dev/null
++++ b/tools/rebuild-swap-prefetch-fix.sh
+@@ -0,0 +1,39 @@
++#!/usr/bin/env bash
++# Incremental engine-only build, keeping the existing inference/vision profile.
++set -euo pipefail
++strata_root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
++strata_build="$strata_root/build-memory-fix-hip"
++if ! command -v cmake >/dev/null; then
++    printf '%s\n' 'Activate the existing Strata .venv (cmake is required), then retry.' >&2
++    exit 1
++fi
++if [[ ! -f "$strata_build/CMakeCache.txt" ]]; then
++    printf '%s\n' 'Run tools/rebuild-memory-fix.sh for the initial build first, then retry this script.' >&2
++    exit 1
++fi
++cmake -S "$strata_root" -B "$strata_build" \
++    -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF \
++    -DCMAKE_HIP_ARCHITECTURES="${STRATA_HIP_ARCH:-gfx1030}" \
++    -DSTRATA_PREFILL_MMQ=ON -DSTRATA_PORTABLE=OFF \
++    -DSTRATA_BUILD_TESTS=OFF -DSTRATA_BUILD_CONVERSATION_TESTS=OFF \
++    -DSTRATA_GGML_DIR="$strata_root/third_party/llama.cpp"
++cmake --build "$strata_build" --target strata -j "${STRATA_BUILD_JOBS:-2}"
++"$strata_build/strata" --help >/dev/null 2>&1
++for strata_marker in 'idle GPU shadows: live ownership v2' 'resident swap prefetch v1' 'STRATA_RESIDENT_SWAP_PREFETCH'; do
++    if ! LC_ALL=C grep -aFq "$strata_marker" "$strata_build/strata"; then
++        printf '%s\n' 'The built engine lacks the correction; the installed engine was not changed.' >&2
++        exit 1
++    fi
++done
++strata_new="$(mktemp "$strata_root/engine/.strata-swap-prefetch-new.XXXXXX")"
++trap 'rm -f -- "$strata_new"' EXIT
++cp -- "$strata_build/strata" "$strata_new"
++chmod 755 "$strata_new"
++strata_backup="$(mktemp "$strata_root/engine/strata.pre-swap-prefetch.XXXXXX")"
++cp -p -- "$strata_root/engine/strata" "$strata_backup"
++mv -f -- "$strata_new" "$strata_root/engine/strata"
++printf 'Previous engine saved as %s\n' "$strata_backup"
++strata_python=python3
++if [[ -x "$strata_root/.venv/bin/python" ]]; then strata_python="$strata_root/.venv/bin/python"; fi
++"$strata_python" "$strata_root/tools/configure_swap_prefetch.py"
++printf '%s\n' 'Engine rebuilt. Restart run-coder-uncen-iq1_m.sh.'
+--- /dev/null
++++ b/tools/check_translation_http.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++"""Two short, isolated translation calls; record HTTP status, empty bodies and timings."""
++import argparse
++import json
++import os
++import time
++import urllib.error
++import urllib.request
++
++
++def fetch(url, body=None, timeout=60):
++    headers = {'Content-Type': 'application/json'}
++    if os.environ.get('STRATA_API_KEY'): headers['Authorization'] = 'Bearer ' + os.environ['STRATA_API_KEY']
++    req = urllib.request.Request(url, data=json.dumps(body, ensure_ascii=False).encode('utf-8') if body is not None else None,
++                                 headers=headers)
++    started = time.perf_counter()
++    try:
++        with urllib.request.urlopen(req, timeout=timeout) as r:
++            status, raw = r.status, r.read()
++    except urllib.error.HTTPError as e:
++        with e: status, raw = e.code, e.read()
++    except (OSError, urllib.error.URLError) as e:
++        return {'http_status': None, 'error': str(e), 'elapsed_s': round(time.perf_counter() - started, 3)}
++    result = {'http_status': status, 'body_bytes': len(raw), 'elapsed_s': round(time.perf_counter() - started, 3)}
++    if not raw:
++        result['error'] = 'Empty HTTP response body'
++    else:
++        try: result['response'] = json.loads(raw.decode('utf-8'))
++        except (ValueError, UnicodeDecodeError):
++            result.update(error='Response was not valid JSON', body_preview=raw[:4096].decode('utf-8', errors='replace'))
++    return result
++
++
++def check(base, model=None):
++    base = base.rstrip('/')
++    report = {'models': fetch(base + '/v1/models'), 'requests': []}
++    if model is None:
++        models = report['models'].get('response', {}).get('data') or []
++        if not models:
++            report['error'] = 'No model returned; start Strata and wait for ready before running this check'
++            return report
++        model = models[0]['id']
++    body = {'model': model, 'messages': [{'role': 'user', 'content':
++            'Translate Ukrainian to English. Output only the translation:\nПривіт! Як у тебе справи?'}],
++            'reasoning_effort': 'none', 'temperature': 0, 'presence_penalty': 0, 'max_tokens': 128}
++    for label in ('first', 'repeat'):
++        result = fetch(base + '/v1/chat/completions', body)
++        result['request_label'] = label
++        report['requests'].append(result)
++        if result.get('http_status') != 200 or result.get('error'): break
++    return report
++
++
++if __name__ == '__main__':
++    p = argparse.ArgumentParser(description=__doc__)
++    p.add_argument('--base', default='http://127.0.0.1:8099')
++    p.add_argument('--model')
++    args = p.parse_args()
++    print(json.dumps(check(args.base, args.model), ensure_ascii=False, indent=2))
+--- /dev/null
++++ b/tools/test_swap_prefetch_fix.py
+@@ -0,0 +1,124 @@
++import io
++import json
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import tempfile
++import unittest
++from unittest.mock import patch
++import urllib.error
++from tools.configure_swap_prefetch import configure
++from tools.check_translation_http import fetch, check
++
++MARKERS = 'idle GPU shadows: live ownership v2 resident swap prefetch v1 STRATA_RESIDENT_SWAP_PREFETCH'
++
++
++class Configure(unittest.TestCase):
++    def fixture(self, d):
++        root = Path(d); engine = root / 'strata'; engine.write_bytes(MARKERS.encode())
++        original = {'exe': str(engine), 'args': ['--resident-experts', '--max-context', '131072', '--kv', 'int8'],
++                    'env': {'STRATA_RESIDENT_PIN': '0', 'STRATA_RESIDENT_HEADROOM_GIB': '8', 'STRATA_RAM_WORKING_SET': '1'},
++                    'reasoning_auto_budget_tokens': 4096, 'vision': {'gpu': False, 'max_tokens': 300}}
++        path = root / 'config.json'; path.write_text(json.dumps(original))
++        return path, original, engine
++
++    def test_only_prefetch_and_diagnostics_are_enabled(self):
++        with tempfile.TemporaryDirectory() as d:
++            p, before, _ = self.fixture(d)
++            after, backup = configure(p)
++            self.assertEqual(json.loads(backup.read_text()), before)
++            expected = json.loads(json.dumps(before))
++            expected['env']['STRATA_RESIDENT_SWAP_PREFETCH'] = '1'; expected['runtime_memory_log'] = True
++            self.assertEqual(after, expected)
++
++    def test_existing_opt_out_is_preserved(self):
++        with tempfile.TemporaryDirectory() as d:
++            p, cfg, _ = self.fixture(d)
++            cfg['env'].update(STRATA_LOOKAHEAD='0', STRATA_RESIDENT_SWAP_PREFETCH='0')
++            p.write_text(json.dumps(cfg)); after, _ = configure(p)
++            self.assertEqual(after['env']['STRATA_LOOKAHEAD'], '0')
++            self.assertEqual(after['env']['STRATA_RESIDENT_SWAP_PREFETCH'], '0')
++
++    def test_old_engine_is_rejected_before_any_write(self):
++        with tempfile.TemporaryDirectory() as d:
++            p, cfg, exe = self.fixture(d); exe.write_bytes(b'idle GPU shadows: live ownership v2')
++            with self.assertRaises(ValueError): configure(p)
++            self.assertEqual(json.loads(p.read_text()), cfg)
++            self.assertEqual(list(p.parent.glob('*.before-swap-prefetch-*')), [])
++
++
++class Install(unittest.TestCase):
++    def run_case(self, fail=False, stale=False):
++        with tempfile.TemporaryDirectory() as d:
++            root = Path(d) / 'Strata project'
++            for name in ('tools', 'engine', 'build-memory-fix-hip', 'bin'): (root / name).mkdir(parents=True)
++            (root / 'build-memory-fix-hip/CMakeCache.txt').touch()
++            for name in ('rebuild-swap-prefetch-fix.sh', 'configure_swap_prefetch.py'):
++                shutil.copyfile(Path(__file__).with_name(name), root / 'tools' / name)
++            exe = root / 'engine/strata'; exe.write_bytes(b'old engine')
++            vision = root / 'engine/strata-vision'; vision.write_bytes(b'old vision')
++            cfg = {'exe': str(exe), 'args': ['--resident-experts', '--max-context', '131072'],
++                   'reasoning_auto_budget_tokens': 8192, 'vision': {'gpu': False, 'max_tokens': 300}}
++            path = root / 'strata-coder-uncen-iq1_m.json'; path.write_text(json.dumps(cfg))
++            cmake = root / 'bin/cmake'
++            cmake.write_text('''#!/bin/bash
++set -eu
++if [[ "$1" == "--build" ]]; then
++    [[ "${TEST_FAIL:-0}" == "0" ]] || exit 42
++    printf '#!/bin/sh\\n# %s\\nexit 0\\n' "${TEST_MARKERS}" > "$2/strata"
++    chmod +x "$2/strata"
++fi
++'''); cmake.chmod(0o755)
++            env = {**os.environ, 'PATH': str(root / 'bin') + os.pathsep + os.environ['PATH'],
++                   'TEST_FAIL': '1' if fail else '0', 'TEST_MARKERS': 'old engine' if stale else MARKERS}
++            r = subprocess.run(['bash', str(root / 'tools/rebuild-swap-prefetch-fix.sh')], env=env, capture_output=True, text=True)
++            self.assertEqual(vision.read_bytes(), b'old vision')
++            backups = list((root / 'engine').glob('strata.pre-swap-prefetch.*'))
++            if fail or stale:
++                self.assertNotEqual(r.returncode, 0, r.stderr)
++                self.assertEqual(exe.read_bytes(), b'old engine')
++                self.assertEqual(json.loads(path.read_text()), cfg)
++                self.assertEqual(backups, [])
++            else:
++                self.assertEqual(r.returncode, 0, r.stderr)
++                self.assertEqual(len(backups), 1); self.assertEqual(backups[0].read_bytes(), b'old engine')
++                after = json.loads(path.read_text())
++                self.assertEqual(after['args'], cfg['args']); self.assertEqual(after['vision'], cfg['vision'])
++                self.assertEqual(after['reasoning_auto_budget_tokens'], 8192)
++
++    def test_install_and_activate(self): self.run_case()
++    def test_failed_build_preserves_everything(self): self.run_case(fail=True)
++    def test_stale_binary_is_not_installed(self): self.run_case(stale=True)
++
++
++class Response(io.BytesIO):
++    status = 200
++
++
++class HTTPProbe(unittest.TestCase):
++    def test_empty_body_reports_status_and_length(self):
++        with patch('urllib.request.urlopen', return_value=Response(b'')):
++            r = fetch('http://127.0.0.1:8099/x')
++        self.assertEqual(r['http_status'], 200); self.assertEqual(r['body_bytes'], 0)
++        self.assertIn('Empty', r['error'])
++
++    def test_http_error_body_is_retained(self):
++        e = urllib.error.HTTPError('http://127.0.0.1:8099/x', 503, 'busy', {}, io.BytesIO(b'{"error":"busy"}'))
++        with patch('urllib.request.urlopen', side_effect=e): r = fetch(e.url)
++        self.assertEqual(r['http_status'], 503); self.assertEqual(r['response']['error'], 'busy')
++
++    def test_two_identical_isolated_requests_preserve_ukrainian(self):
++        seen = []
++        def open_request(req, **kw):
++            if req.data is None: return Response(b'{"data":[{"id":"active-model"}]}')
++            body = json.loads(req.data.decode('utf-8')); seen.append(body)
++            return Response(b'{"choices":[{"message":{"content":"Hi! How are you doing?"}}]}')
++        with patch('urllib.request.urlopen', side_effect=open_request): report = check('http://127.0.0.1:8099')
++        self.assertEqual(len(report['requests']), 2); self.assertEqual(seen[0], seen[1])
++        self.assertIn('Привіт! Як у тебе справи?', seen[0]['messages'][0]['content'])
++        self.assertEqual(seen[0]['reasoning_effort'], 'none')
++        self.assertEqual(seen[0]['model'], 'active-model')
++
++
++if __name__ == '__main__': unittest.main()
+--- /dev/null
++++ b/docs/RESIDENT_SWAP_PREFETCH.md
+@@ -0,0 +1,88 @@
++# Read-ahead for swapped resident experts
++
++The controlled Ukrainian-to-English request returned the correct translation, `Hi! How are you doing?`.
++It generated only eight tokens: its 3.8 tok/s API timing (4.5 tok/s in the server window) is a short burst,
++not a sustained decode benchmark. The important new memory sample is `VmSwap_kib: 8724204`: 8.32 GiB of the
++engine was swapped out, with 7.65 GiB reported available. `VmSwap` alone does not identify the swap device,
++prove all of those bytes are experts, or establish the exact time lost to swap.
++
++## Specific gap corrected
++
++`FileExpertSource::warm()` previously skipped every expert present in the logical host complement. That
++avoids reading duplicate model-file pages, but a pageable host allocation can itself be swapped out. The
++routing lookahead therefore made no swap read-ahead request for those predicted CPU experts.
++
++With `STRATA_RESIDENT_SWAP_PREFETCH=1`, the existing routing lookahead worker also considers the pageable
++resident complement. The existing predictor already excludes experts currently assigned to the GPU.
++
++- Sample the engine's own `VmSwap` once per second. A known zero skips the residency-probe syscall entirely.
++  Unknown swap status retains the guarded page-probe path.
++- Use `mincore` to find absent pages in a predicted expert. Already resident pages need no advice.
++- Request `MADV_WILLNEED` only for cold runs. No expert values are read, overwritten, discarded or requantized.
++- Limit requested read-ahead to 128 MiB per 100 ms, at most eight calls per expert and an 8 MiB expert size cap.
++  These bound requested ranges, not the kernel's exact I/O or eventual physical-memory usage.
++- Check available RAM/commit once per active 100 ms period and reserve admitted hint bytes against a 2,560 MiB
++  free-memory floor. Unknown available memory declines hints. Failed hints also consume their period allowance
++  so errors cannot cause an unbounded retry stream.
++
++There is no additional worker, full-model scan, forced page touch, mlock, GPU registration or new SSD-backed
++weight arena. Inference keeps the existing fallback if hints fail or arrive too late. Pinned/registered/locked
++complements retain their previous behavior. An explicit `STRATA_LOOKAHEAD=0` disables the predictor and is not
++overridden. This revision targets the current Linux GGUF path with routing lookahead enabled.
++
++Linux's advice can schedule anonymous swap reads into swap cache; it does not promise that the pages will
++remain in RAM. Consequently a successful hint is not counted as restored bytes, and `VmSwap` need not
++immediately become zero. The log reports advised MiB, errors and skip counters, not fabricated physical savings.
++
++API references:
++- https://man7.org/linux/man-pages/man2/madvise.2.html
++- https://github.com/torvalds/linux/blob/master/mm/madvise.c (`madvise_willneed` and `swapin_walk_pmd_entry`)
++
++## Install over the current long-context revision
++
++Stop Strata, extract `Strata-swap-prefetch-fix.zip` into `/mnt/ssd`, overwriting files in its `Strata/` folder, then:
++
++```bash
++cd /mnt/ssd/Strata
++source .venv/bin/activate
++bash tools/rebuild-swap-prefetch-fix.sh
++bash run-coder-uncen-iq1_m.sh
++```
++
++The script reuses the existing HIP build directory and builds only the engine. It verifies capability markers,
++backs up the installed engine and current config, then enables the prefetch flag and memory telemetry. Model,
++context, KV, GPU cache, RAM headroom, pinning, thinking, sampling and vision settings are preserved. Existing
++explicit opt-outs are retained. The unchanged source-archive configs do not enable the new mode before a build.
++
++After a request, the engine log contains `resident swap prefetch v1`. The counters are cumulative. A healthy
++zero-swap run should show zero-swap skips and no read-ahead; an affected run can report cold-page advice. Error,
++pressure and budget skips retain normal demand paging and must not be read as successful prefetches.
++
++## Check the empty HTTP response separately
++
++The blank second curl paste does not identify an HTTP status, response size, connection error or engine exit.
++This revision includes a standard-library-only probe that makes two identical short requests and records
++those details:
++
++```bash
++python3 tools/check_translation_http.py > translation-check.json
++```
++
++Run it while the server is ready. It uses the active model reported by `/v1/models`, the same Ukrainian test,
++thinking disabled, temperature zero, presence penalty zero and a 128-token output cap. Those values apply only
++to the two test requests; the config is not edited. `STRATA_API_KEY` may supply authentication and is never
++written to the report. The second call can expose a difference between the first and repeated request, but
++eight output tokens do not measure sustained throughput. The probe does not automatically diagnose a cause.
++
++## Validation and limits
++
++See `RESIDENT_SWAP_PREFETCH_TEST_RESULTS.txt`. The new production helper is tested with injected page-residency
++states and actual Linux `mincore`/`MADV_WILLNEED` calls on read-only file data. Exact expert bytes are retained.
++The host has no swap configured, so actual anonymous swap-in latency, the target model and RX 6800 throughput
++were not tested. HIP/CUDA engine builds are also unavailable here; host syntax checks use CUDA headers.
++
++This corrects the missing resident-page read-ahead path. It does not establish zero swap, prevent arbitrary
++system memory pressure, restore 20 tok/s after every idle period, or explain the empty HTTP response by itself.
++Compare the same workload, idle interval and memory conditions, including the new counters and major faults.
++`RESIDENT_SWAP_PREFETCH.patch` is the delta over the prior long-context source; use the packaged sources and
++rebuild script rather than applying historical patches over them.
+--- /dev/null
++++ b/docs/RESIDENT_SWAP_PREFETCH_TEST_RESULTS.txt
+@@ -0,0 +1,45 @@
++Resident swap read-ahead — 26 October 2026
++
++User-supplied controlled request:
++  correct translation: Hi! How are you doing?
++  prompt 33 tokens, completion 8 tokens, stop
++  native prefill 6,308.6 ms, native decode 2,084.6 ms (3.8 tok/s)
++  server window: 8 tokens in 8 seconds, decode cache hit 43.9%
++  VmSwap 8,724,204 KiB = 8.32 GiB, MemAvailable about 7.65 GiB
++  the second curl paste contained no response/status to establish its cause
++
++Specific code gap: FileExpertSource::warm skipped every host-complement expert,
++even though pageable anonymous expert bytes can be swapped out. The new option
++uses the existing CPU routing lookahead to issue guarded read-ahead requests.
++
++New helper tests:
++  resident read-ahead: 100 checks passed
++  actual file fixture: 512 cold pages; 2.0 MiB MADV_WILLNEED hints; exact bytes
++  retained after read-ahead; actual mincore and zero-swap path exercised
++  injected tests cover 128 MiB/100 ms requested-range budget, 2,560 MiB memory
++  floor, within-period memory reservations, unknown/failed probes, error-rate
++  bounding, page alignment, invalid/overflowed ranges, eight-call fragmentation
++  cap and the once-per-second zero-swap fast path
++  AddressSanitizer and UndefinedBehaviorSanitizer passed; leak scanning disabled
++  for the host tracing environment
++
++CMake/CTest: 7/7 passed
++  resident_readahead_test, ram_working_set_test, idle_gpu_ownership_test,
++  idle_gpu_shadows_test, vision_records_test, conversation_memory_test,
++  session_save_reclaim_test
++
++Python: 33 tests passed in 3.507 seconds
++  tools.test_swap_prefetch_fix, tools.test_long_context_fix,
++  serve.test_reasoning_policy, serve.test_resident_recovery
++  Includes old-binary rejection, failed-build preservation, backups, preservation
++  of model/memory/vision/thinking settings, explicit opt-outs, HTTP status/body
++  capture, empty-body detection and exact Unicode in isolated test requests.
++
++Host C++20 syntax: generate.cpp and expert_source.cpp passed using CUDA 12.9
++headers, zero diagnostics. Shell/Python syntax and whitespace checks passed.
++
++Limits: this host has no configured swap, AMD GPU, ROCm compiler or target model.
++The file fixture is not an anonymous swap benchmark. No full HIP/CUDA engine
++build, target paging-latency measurement or model throughput/quality validation
++was performed. Advised bytes are requested ranges, not measured restored RAM
++or exact physical I/O. Read-ahead cannot pin memory or guarantee zero swap.
+--- a/docs/LONG_CONTEXT_FIX.md
++++ b/docs/LONG_CONTEXT_FIX.md
+@@ -1,4 +1,8 @@
+ # Long-context RAM working set and thinking allowance
++
++The subsequent resident-page read-ahead revision is documented in `RESIDENT_SWAP_PREFETCH.md`. It addresses
++pageable host experts being skipped by routing prefetch after Linux swaps them out, without changing this
++revision's RAM allocation or thinking policy.
+ 
+ This revision follows the `live ownership v2` correction. The latest supplied run completed without OOM and
+ without the earlier wrong-expert restore, but its 62,133-token prompt and 16,332 generated tokens took about

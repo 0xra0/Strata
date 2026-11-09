@@ -999,7 +999,9 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 
 void FileExpertSource::close() {
     io_stop();
+    prompt_reader_.close();
     inputs_.clear();
+    idle_shadows_.clear();
     if (complement_arena_ != nullptr) {
         if (complement_pinned_ && !complement_registered_) (void) cudaFreeHost(complement_arena_);
         else {
@@ -1678,6 +1680,14 @@ bool FileExpertSource::open_prompt_direct(std::string& why) {
 #endif
 }
 
+bool FileExpertSource::open_prompt_stream(std::string& why) {
+    if (base_ == nullptr || unmapped_ || !direct_.empty() || !pdirect_.empty()) {
+        why = "requires the mapped, buffered file tier without STRATA_PROMPT_DIRECT";
+        return false;
+    }
+    return prompt_reader_.open(paths_, why);
+}
+
 bool FileExpertSource::set_unbuffered(uint64_t ram_bytes, std::string& why) {
 #if defined(_WIN32) || defined(__linux__)
     if (base_ == nullptr || paths_.empty() || !direct_.empty()) {
@@ -2176,8 +2186,27 @@ void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
         const int64_t e = experts[j];
         if (e < 0 || e >= n_expert_) continue;
         const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) e;
-        if (complement_ready_ && resident_blob(index) != nullptr)
-            continue;                                                    // in the RAM copy
+        if (complement_ready_) {
+            if (const uint8_t* ram = resident_blob(index)) {
+#if defined(__linux__)
+                static const bool swap_ahead = [] {
+                    const char* v = std::getenv("STRATA_RESIDENT_SWAP_PREFETCH");
+                    return v && std::atoi(v) != 0;
+                }();
+                // Allocation in the host tier does not imply physical residency:
+                // Linux can swap the pageable complement during idle periods.
+                // The existing lookahead worker requests only predicted CPU rows.
+                if (swap_ahead && !complement_pinned_ && !complement_registered_ && !complement_locked_)
+                    resident_readahead_.hint(ram, (size_t) layer_blob_bytes_[(size_t) layer], [](uint64_t& free) {
+                        uint64_t commit = 0;
+                        if (!available_memory_bytes(free, &commit)) return false;
+                        free = std::min(free, commit);
+                        return true;
+                    });
+#endif
+                continue;
+            }
+        }
         if (warm_stamp_) warm_stamp_[index].store(stamp, std::memory_order_relaxed);
         warm_count_.fetch_add(1, std::memory_order_relaxed);
         if (io_pf_ && direct_.empty()) {   // read it ahead with pread on the I/O threads (instead of an madvise hint)
@@ -2534,6 +2563,20 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
         }
     }
     const auto t0 = std::chrono::steady_clock::now();
+    if (prompt_reader_.active()) {
+        Span ranges[3];
+        const int count = spans(layer, expert, ranges);
+        if (!count) return false;
+        for (int r = 0; r < count; ++r) {
+            const size_t file = role_ptr_.empty() ? 0 : (size_t) role_file_[(size_t) (3 * layer + r)];
+            const auto& range = ranges[r];
+            if (!prompt_reader_.read(file, range.p, range.off, range.n, dst + range.at)) return false;
+        }
+        file_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
+                           std::memory_order_relaxed);
+        file_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+        return true;
+    }
     if (!copy_from_files(layer, expert, dst)) return false;
     file_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
                        std::memory_order_relaxed);
@@ -3295,7 +3338,84 @@ bool FileExpertSource::pin_cache_complement(
     return true;
 }
 
+bool FileExpertSource::release_idle_gpu_shadows(ExpertCache& cache, const std::vector<int32_t>& live_residency,
+                                               size_t& bytes, std::string& err,
+                                               bool refresh_gpu) {
+    bytes = 0;
+    err.clear();
+#if defined(__linux__)
+    if (idle_shadows_.active()) { bytes = idle_shadows_.released_bytes(); return true; }
+    if (!complement_ready_ || complement_arena_ == nullptr || !cache.valid()) return true;
+    if (complement_pinned_ || complement_registered_ || complement_locked_ || exchange_storage_.active() ||
+        !staged_.empty() || fs_swap_.load(std::memory_order_acquire) != nullptr) {
+        err = "idle GPU shadows: pinned/rotated/in-flight experts cannot be reclaimed";
+        return true;  // unsupported combination: leave every page resident
+    }
+    std::vector<detail::GpuShadowBlob> blobs;
+    if (!detail::gpu_shadow_plan(complement_offsets_, layer_blob_bytes_, (size_t) n_expert_,
+                                 live_residency, (size_t) cache.slots(), blobs, err)) return false;
+    for (const auto& b : blobs) {
+        if (cache.device_slot(b.slot) == nullptr || b.offset > complement_bytes_ ||
+            b.bytes > complement_bytes_ - b.offset ||
+            b.bytes > (size_t) (cache.bytes_of((int64_t) b.slot + 1) - cache.bytes_of(b.slot))) {
+            err = "idle GPU shadows: invalid cache slot or host bounds before reclaim";
+            return false;
+        }
+    }
+    if (blobs.empty()) return true;
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        err = "idle GPU shadows: GPU did not finish before reclaim";
+        (void) cudaGetLastError();
+        return false;
+    }
+    // At startup or after relayout, prefill may have initialized scratch in the
+    // tail slots without changing their ownership table. Make those exact RAM
+    // bytes authoritative on the GPU before discarding any host page.
+    if (refresh_gpu) {
+        for (const auto& b : blobs) {
+            if (!cache.fill_slot_blocking(b.slot, (const uint8_t*) complement_host_ + b.offset, err, (int64_t) b.bytes)) {
+                err = "idle GPU shadows: could not refresh VRAM before reclaim: " + err;
+                (void) cudaGetLastError();
+                return false;
+            }
+        }
+    }
+    if (!idle_shadows_.release(complement_arena_, (size_t) complement_bytes_, std::move(blobs), err)) return false;
+    bytes = idle_shadows_.released_bytes();
+#else
+    (void) cache; (void) live_residency; (void) refresh_gpu;
+#endif
+    return true;
+}
+
+bool FileExpertSource::restore_idle_gpu_shadows(const ExpertCache& cache,
+                                               const std::vector<int32_t>& live_residency, std::string& err) {
+    err.clear();
+    if (idle_shadows_.active() && live_residency.size() != complement_offsets_.size()) {
+        err = "idle GPU shadows: live ownership table changed shape before restore";
+        return false;
+    }
+    return idle_shadows_.restore(complement_arena_, [&](const detail::GpuShadowBlob& b, uint8_t* dst, std::string& why) {
+        const uint8_t* gpu = cache.device_slot(b.slot);
+        if (b.expert >= complement_offsets_.size() || complement_offsets_[b.expert] != b.offset ||
+            !detail::gpu_shadow_owner_matches(b, live_residency) || gpu == nullptr ||
+            cache.bytes_of((int64_t) b.slot + 1) - cache.bytes_of(b.slot) < (int64_t) b.bytes) {
+            why = "idle GPU shadows: cache ownership changed before restore";
+            return false;
+        }
+        if (!cache.copy_slot_to_host_blocking(b.slot, dst, why, (int64_t) b.bytes)) {
+            why = "idle GPU shadows: restore from VRAM failed: " + why;
+            (void) cudaGetLastError();
+            return false;
+        }
+        return true;
+    }, err);
+}
+
 const uint8_t* FileExpertSource::resident_blob(size_t index) const {
+    // Defensive fallback for a source query made while the engine is idle: never
+    // expose discarded (zero) bytes as weights. Normal inference restores first.
+    if (idle_shadows_.active() && idle_shadows_.missing(index)) return nullptr;
     if (exchange_storage_.active()) return exchange_storage_.resident(index).host;
     return detail::cache_complement_blob_or_fallback(index, complement_offsets_, complement_host_, nullptr);
 }

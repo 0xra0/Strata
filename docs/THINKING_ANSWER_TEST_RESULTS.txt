@@ -1,0 +1,58 @@
+Thinking-only completion correction, 2026-10-26
+
+BEFORE THE CHANGE
+The new closed-thinking HTTP fixture failed against version 7:
+  expected "The work is complete.", actual content=None, finish_reason=stop.
+The fixture had reasoning_close_retry enabled already, confirming the old
+held-</think> exclusion independently of the default-off setting.
+
+VALIDATION
+202 distinct relevant tests pass across the selected regression set and the
+final boundary/config checks. The initial 198-test regression run passed 197
+and skipped one JSON-schema test because jsonschema was missing. That dependency
+was installed for testing; the skipped test was then run and passed. Four added
+HTTP/logging boundary tests also passed. The final 31-test HTTP boundary module
+passed after the last server change.
+
+Selected regression modules/classes:
+  serve.test_reasoning_completion, tools.test_reasoning_answer_fix,
+  serve.test_server.ReasoningCloseRetry, .ThinkingBudget, .ForcedToolChoice,
+  .StopStrings, serve.test_reasoning_policy, serve.test_reasoning_rescue,
+  serve.test_reasoning_tools, serve.test_reasoning_loop_recovery,
+  serve.test_request_accounting, serve.test_responses, serve.test_fatal_recovery.
+
+The 31 final HTTP tests exercise real local HTTP handlers with a scripted engine:
+  - Open, held-closed, closed and whitespace-only reasoning endings.
+  - Unicode reasoning; original canonical prefix/newlines preserved.
+  - Default-off/single-generation behavior and ordinary valid answers.
+  - Thinking disabled; cancellation; explicit stop sequences; partial stop
+    matches held for later flushing; original token cap and marker-room limits.
+  - One retry maximum, explicit repeated-empty errors, and a healthy next request.
+  - Zed-style OpenAI SSE: one assistant role, answer before one stop and [DONE].
+  - Pending reasoning tool calls, visible calls and forced tool selection, each
+    without duplicate calls or altered arguments.
+  - Unchanged sampling across segments, original prompt/cache accounting.
+  - OpenAI, Anthropic and Responses buffered/streaming successes and failures.
+  - Prompt-free continuation/failure notes in the current engine log.
+
+Five activation-helper tests verify the exact one-flag delta, preservation of
+model args, budgets, sampling, memory flags and vision; backups and permissions;
+old-source/invalid-config rejection; atomic-replace failure cleanup; idempotency.
+
+Python compilation and whitespace checks passed. Existing telemetry ResourceWarnings
+occurred in the suite; no test failed. The update touches no C++/HIP/CUDA/SYCL
+files and needs no GPU engine rebuild.
+
+LIMITS
+Generation is scripted in the host tests, not the user's AMD model. These tests
+validate protocol/state/control-flow behavior, not model quality or GPU speed.
+The attached Zed log supplies the real-model observations in THINKING_ANSWER_FIX.md.
+There was no live access to the user's Strata/Zed processes. A model that remains
+empty after the bounded continuation is reported as an error, not given invented
+answer text. Explicit user stops/cancellation/limits retain their meanings.
+
+PACKAGING
+The delta is against full-project version 7. Its application is checked and the
+changed source bytes are compared. The small archive contains only the explicit
+server/helper/test/docs file list. The full archive retains unrelated entries,
+including the engine binary and previous memory/performance fixes.

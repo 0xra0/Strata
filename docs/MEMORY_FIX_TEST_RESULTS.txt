@@ -1,0 +1,67 @@
+Ownership correction — 26 October 2026
+
+Cause reproduced: the old idle path used ExpertCache::slot_of(), which retains
+the startup profile after adaptive swaps. The fixture performs a real reclaim
+and restore with that stale table and observes expert 0 overwritten by expert 3.
+The corrected path requires the live serve host_res table at release and restore.
+
+New regression (actual production planner, GPU slots simulated in host memory):
+idle GPU ownership: 14602 checks passed; reproduced old wrong-expert restore;
+769 adaptive swaps, 256 exact reclaim/restore rounds.
+AddressSanitizer + UndefinedBehaviorSanitizer: passed. Leak scanning disabled
+because the host tracing environment prevents LeakSanitizer thread scanning.
+CTest: idle_gpu_ownership_test, idle_gpu_shadows_test, vision_records_test,
+conversation_memory_test, session_save_reclaim_test: 5/5 passed (0.52 seconds).
+Installer/profile tests: 11 passed (0.173 seconds); includes rejection of the
+earlier unsafe memory engine, engine-only rebuild, failed-build protection,
+backup retention and byte-identical preservation of current vision/config.
+generate.cpp + expert_source.cpp: C++20 host syntax checks passed with CUDA 12.9
+headers, zero diagnostics. Shell syntax and whitespace checks passed.
+
+The old multi-GiB target reclaim counts are not reliable savings measurements:
+CPU-only weights could be misclassified. Correct release may be smaller or zero.
+No target AMD full-model reproduction or HIP/CUDA engine build was possible here.
+The original memory-pressure problem is not proven solved by this correction.
+
+Earlier lifecycle validation (server/vision unchanged in this correction)
+---------------------------------------------------------------------
+The earlier fixed-ownership RAM fixture below did not exercise adaptive swaps
+and therefore missed the ownership bug. The new regression above covers it.
+
+Fully built here: modified CPU strata-vision, mtmd and GGML dependencies.
+Actual GGML CPU workspace test (persistent weights + scratch allocation lifecycle):
+clip_ctx: CLIP using CPU backend
+workspace round 0: freed=134217728 bytes RSS before=136200 KiB after=5156 KiB hash=842a591a98222325
+workspace round 1: freed=134217728 bytes RSS before=136252 KiB after=5628 KiB hash=842a591a98222325
+workspace round 2: freed=134217728 bytes RSS before=136740 KiB after=9344 KiB hash=842a591a98222325
+CPU workspace integration: passed
+
+Real anonymous-memory reclaim/restore fixture (VRAM source simulated in host memory):
+idle shadows: 22 checks passed; fixture RSS before=296588 KiB idle=198344 KiB reduction=95.9 MiB
+
+Selected server/API and installer suite:
+----------------------------------------------------------------------
+Ran 468 tests in 174.872s
+
+OK
+
+Focused installer/profile rerun after adding activation ordering: 7 tests passed.
+  Includes failed vision build leaving both prior binaries and config intact;
+  both binary installs preceding profile activation; existing args/image values preserved;
+  old encoder rejected; GPU vision not silently changed to CPU.
+CMake/CTest: idle_gpu_shadows_test, vision_records_test, conversation_memory_test,
+  session_save_reclaim_test: 4/4 passed.
+Vision CTest: cpu_workspace_test: 1/1 passed.
+Checkpoint retention: existing conv_cache_test passed, including 3,200 comparisons
+  of pre-capture recycling against the prior eviction policy.
+Host syntax: src/program/generate.cpp, src/core/expert_source.cpp,
+  src/core/expert_cache.cpp passed with real CUDA 12.9 headers.
+Public mtmd header: C11 syntax check passed.
+Shell/Python syntax and git diff whitespace checks passed.
+
+Limits: no actual AMD GPU, ROCm/HIP compiler, full CUDA compiler or target GGUF
+model weights are available here. No full HIP/CUDA engine build, full-model
+image-quality test, target peak-RAM test or 25 tok/s measurement was performed.
+The host-shadow fixture simulates the authoritative GPU bytes in host RAM.
+The CPU GGML test uses synthetic tensors, not the user's complete projector.
+Real released memory and boundary-copy times must be taken from target logs.

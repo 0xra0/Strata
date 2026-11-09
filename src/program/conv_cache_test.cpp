@@ -53,6 +53,26 @@ int64_t reuse_after_edit(bool spread, int64_t root, int64_t turn, int turns, int
 }
 
 int main() {
+    // Pre-capture recycling must choose the exact victim of the existing
+    // append-then-evict policy, including its implicit root pin.
+    bool recycling_exact = true;
+    for (size_t cap = 1; cap <= 16; ++cap) {
+        for (uint64_t seed = 1; seed <= 200; ++seed) {
+            std::vector<uint64_t> old;
+            for (size_t i = 0; i < cap; ++i) old.push_back((seed * 137 + i * 7919) % 100000);
+            auto appended = old;
+            appended.push_back(100001);
+            const auto before = strata::program::conv_cache::reuse_before_capture(old.data(), old.size(), cap, true);
+            const auto after = eviction_victim(appended.data(), appended.size(), cap);
+            recycling_exact &= before == after;
+        }
+    }
+    check(recycling_exact, "recycle before capture matches 3,200 old-policy decisions");
+    const uint64_t stamps_for_reuse[] = {1, 2, 3};
+    check(strata::program::conv_cache::reuse_before_capture(stamps_for_reuse, 3, 3, false) == 3,
+          "special pin/tail/spread policies decline recycling");
+    check(strata::program::conv_cache::reuse_before_capture(stamps_for_reuse, 3, 6, true) == 3,
+          "cache below capacity does not discard an entry");
     std::printf("conv_cache_test\n");
     {   // --prompt-cache-spread: 200 turns of 1,000 tokens after a 9,525-token system prompt, 6 checkpoints
         const int64_t end = 9525 + 200 * 1000;

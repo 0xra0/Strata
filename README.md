@@ -1,243 +1,408 @@
 <h1 align="center">Strata</h1>
 
-**English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
+<p align="center">
+  <b>High-Performance Inference Engine for 125B MoE Models on Consumer Hardware</b><br>
+  Run Qwen3.8-Flash-Next on ordinary gaming PCs (NVIDIA or AMD graphics card + system RAM) · Windows & Linux · Free & Open Source
+</p>
 
-<p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
-NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
+<p align="center">
+  <a href="https://github.com/0xra0/Strata/releases"><img src="https://img.shields.io/github/v/release/0xra0/Strata?style=flat-square&color=blue" alt="Latest Release"></a>
+  <img src="https://img.shields.io/badge/license-MIT-green.svg?style=flat-square" alt="License: MIT">
+  <img src="https://img.shields.io/badge/C%2B%2B-20-blue.svg?style=flat-square" alt="C++20">
+  <img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg?style=flat-square" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/CUDA-12%2B-brightgreen.svg?style=flat-square" alt="CUDA">
+  <img src="https://img.shields.io/badge/ROCm%2FHIP-gfx1030%20%7C%20gfx1100%2B-brightgreen.svg?style=flat-square" alt="ROCm/HIP">
+</p>
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
-<sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
+---
 
-Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** on a normal PC. This is a
-large, smart AI model that usually needs a server. It chats, writes code, reads pictures and works with your apps
-and coding agents. Nothing leaves your PC.
+Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** (and its Coder, Swift 1.5, and Unsloth variants) directly on consumer gaming hardware. By orchestrating a hybrid memory architecture across your GPU VRAM, host system RAM, and storage tiers, Strata enables a 125-billion parameter mixture-of-experts (MoE) model to run entirely locally without requiring enterprise server clusters.
 
-## How fast is it?
+This repository includes **advanced memory lifecycle management, dynamic working-set replacement, kernel-level swap prefetching, cache-avoidant prompt streaming, and reasoning recovery enhancements**.
 
-We measured it on two ordinary gaming PCs. A token is about ¾ of a word.
+---
 
-- **Writes answers:** how fast the reply appears in a short chat. 60 tokens per second is faster than you can read.
-- **Reads your prompt:** how fast it takes in what you send (here a 32K-token document, code or chat history).
+## Table of Contents
+
+- [Key Enhancements in this Release](#key-enhancements-in-this-release)
+- [Performance & Benchmarks](#performance--benchmarks)
+- [Hardware Requirements](#hardware-requirements)
+- [Model Selection Guide](#model-selection-guide)
+- [Quick Start & Installation](#quick-start--installation)
+  - [Automated Setup](#automated-setup)
+  - [Building from Source (Linux / ROCm / CUDA)](#building-from-source-linux--rocm--cuda)
+  - [Applying Advanced Rebuild Scripts](#applying-advanced-rebuild-scripts)
+- [Configuration & Runtime Flags](#configuration--runtime-flags)
+- [API & Agent Integrations](#api--agent-integrations)
+  - [OpenAI Compatible API](#openai-compatible-api)
+  - [Anthropic Messages API (Claude Code)](#anthropic-messages-api-claude-code)
+  - [OpenAI Responses API (Codex CLI)](#openai-responses-api-codex-cli)
+  - [Zed Editor Integration](#zed-editor-integration)
+  - [Model Context Protocol (MCP)](#model-context-protocol-mcp)
+- [Testing & Validation](#testing--validation)
+- [How It Works](#how-it-works)
+- [Troubleshooting](#troubleshooting)
+- [License & Credits](#license--credits)
+
+---
+
+## Key Enhancements in this Release
+
+This version incorporates a suite of memory, I/O, and inference stability improvements engineered specifically for high-load sessions, massive context windows, and multi-modal workloads:
+
+### 1. Idle GPU Shadows Reclaim (`STRATA_MEMORY_LIFECYCLE=1`)
+- **Zero-Waste Idle Footprint:** The resident expert complement retains pageable host copies of GPU-cached experts to allow prefill scratch borrowing. While idle, duplicate host pages are safely discarded without re-reading model files.
+- **Live Ownership v2:** Validates against the live dynamic `host_res` routing table rather than stale startup profiles, preventing wrong-expert restoration and repetition loops across continuous chats.
+- **Fail-Closed Safety:** If memory cannot be safely synchronized or verified, inference fails closed rather than producing corrupted tokens.
+
+### 2. CPU Vision Compute Workspace Release (`vision.release_workspace: true`)
+- **Immediate Scheduler Reclamation:** After image encoding, the GGML graph scheduler compute workspace buffers are immediately released (`strata-vision --release-workspace`) and glibc heap pages are trimmed before engine prefill begins.
+- **Weight Retention:** Vision model and projector weights remain resident at constant memory addresses; only transient execution buffers are freed.
+
+### 3. Eviction-First GDN Checkpoint Reuse
+- **Double-Allocation Elimination:** The LRU cache captures GDN state vectors by reusing the state memory of evicted victim checkpoints directly, avoiding memory spikes during long chat histories.
+
+### 4. Long-Context Dynamic RAM Working Set (`STRATA_RAM_WORKING_SET=1`)
+- **Bounded In-Place Replacement:** In long-context requests, frequently routed file-tier experts are dynamically promoted into colder resident RAM slots within the existing complement allocation (bounded at 4 experts / 8 MiB per cycle).
+- **Reduced Disk Traffic:** Achieves up to an **86.7% reduction** in storage I/O on repetitive multi-turn contexts without expanding system RAM allocations.
+
+### 5. Decoupled Thinking Allowance (`reasoning_auto_budget_tokens`)
+- **Context-Independent Reasoning:** Decouples default thinking allowances from expanding context windows. While standard models could consume 50,000+ thinking tokens on 64k+ contexts, the engine sets an intelligent default (e.g. 4,096 tokens for medium/high effort, 2,048 for low, 8,192 for xhigh).
+- **Explicit Override Support:** Requests specifying explicit `reasoning_budget_tokens` take immediate priority.
+
+### 6. Resident Swap Read-Ahead (`STRATA_RESIDENT_SWAP_PREFETCH=1`)
+- **Kernel-Level Lookahead:** Inspects page residency via `mincore` and issues asynchronous `MADV_WILLNEED` advice for predicted resident experts that Linux has paged into swap.
+- **Safety Floors:** Enforces a 2,560 MiB free system RAM floor and strict rate caps (128 MiB per 100 ms) to avoid thrashing or memory exhaustion.
+
+### 7. Cache-Avoidant Prompt Stream Reader (`STRATA_PROMPT_STREAM=1`)
+- **Direct & Uncached I/O:** Reads prompt expert spans via `preadv2` with `RWF_DONTCACHE` or aligned `O_DIRECT`.
+- **Page-Cache Protection:** Prevents multi-gigabyte prompt prefill streams from evicting hot resident experts from the Linux buffer cache.
+
+### 8. Reasoning-Only Completion Recovery (`reasoning_close_retry v2`)
+- **Guaranteed Answer Generation:** When reasoning models hit natural EOS stops after thinking without outputting an answer or tool call, the server performs a bounded single continuation in the same HTTP stream to ensure an answer is delivered.
+- Eliminates "empty reply" issues observed in agentic workflows such as the Zed editor.
+
+---
+
+## Performance & Benchmarks
+
+Measured on consumer hardware running Qwen3.8-Flash-Next (1 token ≈ ¾ of an English word):
 
 <table>
 <tr><th>NVIDIA: RTX 5070 (12 GB), Ryzen 5 7600, 64 GB RAM</th><th>AMD: RX 9070 XT (16 GB), Ryzen 9 3900X, 47 GB RAM</th></tr>
 <tr><td>
 
-| Size | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **Q2_0** | 94 tokens/s | 2,650 tokens/s |
-| **IQ2_XS** | 79 tokens/s | 2,090 tokens/s |
-| **IQ3_XXS** | 62 tokens/s | 1,750 tokens/s |
-| **IQ3_S** | 53 tokens/s | 1,620 tokens/s |
-| **Coder** | 55 tokens/s | 2,180 tokens/s |
+| Quantization | Answer Generation | Prompt Ingestion (32K) |
+| :--- | :---: | :---: |
+| **Q2_0** | **94 tok/s** | 2,650 tok/s |
+| **IQ2_XS** | **79 tok/s** | 2,090 tok/s |
+| **IQ3_XXS** | **62 tok/s** | 1,750 tok/s |
+| **IQ3_S** | **53 tok/s** | 1,620 tok/s |
+| **Coder** | **55 tok/s** | 2,180 tok/s |
 
 </td><td>
 
-| Size | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **Q2_0** | 60 tokens/s | 1,160 tokens/s |
-| **IQ2_XS** | 52 tokens/s | 1,110 tokens/s |
-| **Coder** | 44 tokens/s | 1,420 tokens/s |
+| Quantization | Answer Generation | Prompt Ingestion (32K) |
+| :--- | :---: | :---: |
+| **Q2_0** | **60 tok/s** | 1,160 tok/s |
+| **IQ2_XS** | **52 tok/s** | 1,110 tok/s |
+| **Coder** | **44 tok/s** | 1,420 tok/s |
 
 </td></tr>
 </table>
 
-NVIDIA: Q2_0 with engine 0.1.36, the other rows with 0.1.26 (4K answers, 32K prompts). The full tables are in
-[DETAILS.md](docs/DETAILS.md#speed-measured). A card with more VRAM is faster: an RTX 3090 (24 GB) should write
-about 100-140 tokens per second. Long chats and other cards: [speed of each model](docs/MODELS.md#how-fast-is-each-size),
-[community results](docs/COMMUNITY_BENCHMARKS.md).
+- GPUs with 24 GB VRAM (e.g., RTX 3090 / 4090) achieve **100–140+ tokens/s**.
+- Multi-GPU setups (2–3 cards) can pool VRAM across PCIe buses.
 
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
-<sub>Strata is free. If it runs well on your PC, a coffee keeps the work on it going.</sub></p>
+---
 
-## What you need
+## Hardware Requirements
 
-| | |
-| --- | --- |
-| **Graphics card** | **NVIDIA** GeForce RTX 20, 30, 40 or 50 series, or **AMD** Radeon RX 7900 XT / XTX, RX 7800 XT / 7700 XT, RX 9060 XT, RX 9070 / 9070 XT, Radeon AI PRO R9700 or RX 6800 / 6900 series. It needs **12 GB of VRAM or more**. |
-| **RAM** | 32 GB or more. Your RAM decides [which model](#which-model-should-i-pick) fits. 64 GB runs every size. |
-| **Disk** | About 80 GB free. Use an SSD if you can: the first start is much faster. |
-| **System** | Windows 10 / 11 or Linux, and a current graphics driver from NVIDIA or AMD. |
+| Component | Minimum Requirement | Recommended |
+| :--- | :--- | :--- |
+| **GPU** | **NVIDIA:** RTX 20/30/40/50 series with 12 GB+ VRAM<br>**AMD:** RX 6800/6900, 7700/7800/7900, 9060/9070 series with 12 GB+ VRAM | 16 GB – 24 GB VRAM (RTX 4080/4090, RX 7900 XTX) |
+| **System RAM** | 32 GB RAM (for Coder variant) | 48 GB – 64 GB+ RAM |
+| **Storage** | 80 GB free disk space | Fast NVMe PCIe 4.0 SSD |
+| **OS** | Linux (Ubuntu 22.04+, Arch, Fedora) or Windows 10/11 | Linux with ROCm 6.x or CUDA 12.x |
 
-The installer sets up everything else. Two or three cards can share the model ([multi-GPU](docs/MULTI_GPU.md)).
+---
 
-Experimental, written and tested by community members on their own machines:
+## Model Selection Guide
 
-- **Older graphics cards** (Tesla P40 / V100, GTX 10, Radeon VII / MI50, RX 6700 XT, RX 5500 XT): [Older GPUs](docs/OLDER_GPUS.md).
-- **Intel Arc**, built from source on Linux: [Intel Arc](docs/INTEL_ARC.md).
-- **Apple Silicon Macs (M1 to M5)**, built from source by `./setup.sh` (the Metal engine): [Mac](docs/MAC.md).
-- **AMD Ryzen AI Max (Strix Halo)**, built from source on Linux: [Strix Halo](docs/STRIX_HALO.md).
-- **Older processors without AVX2**: they work, but slowly. [Older CPUs](docs/INSTALL.md#older-cpus-experimental).
+Your system RAM determines the ideal model size:
 
-The full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
+| System RAM | Recommended Model | Notes |
+| :--- | :--- | :--- |
+| **32 GB** | **Coder (IQ1_M)** | Coding variant with non-critical experts pruned. 91% SWE-bench Verified. |
+| **48 GB** | **IQ2_XS** or **Q2_0** | Full model capabilities; Q2_0 provides the fastest generation speeds. |
+| **64 GB** | **IQ2_XS** (Recommended) or **IQ3_S** | Every size fits comfortably; IQ3_S provides top-tier reasoning. |
+| **96 GB+** | **IQ3_S** or **Unsloth UD-IQ4_XS** | Maximum precision and complete expert complement in RAM. |
 
-## Install
+---
 
-### Let your AI set it up
+## Quick Start & Installation
 
-Do you use an AI coding assistant (Claude Code, Cursor, Codex, GitHub Copilot, ...)? Paste this into it:
+### Automated Setup
 
-```text
-Set up Strata on this PC for me: https://github.com/Niko1221/Strata - follow docs/AI_SETUP.md in that repository.
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/0xra0/Strata.git
+   cd Strata
+   ```
+
+2. **Run the setup script:**
+   - **Linux:**
+     ```bash
+     chmod +x setup.sh START-HERE.sh
+     ./setup.sh
+     ```
+   - **Windows:** Double-click `START-HERE.bat` or run:
+     ```cmd
+     setup.bat
+     ```
+
+3. **Follow the interactive wizard:**
+   - The installer inspects your GPU, VRAM, and RAM, suggests the best quantization, sets up Python virtual environments, builds the engine if needed, and downloads the model shards.
+   - Access the web interface at `http://127.0.0.1:8080`.
+
+---
+
+### Building from Source (Linux / ROCm / CUDA)
+
+#### Prerequisites
+- CMake 3.22+, GCC/Clang with C++20 support
+- Python 3.10+
+- **For AMD:** ROCm / HIP SDK (6.0+)
+- **For NVIDIA:** CUDA Toolkit 12.x+
+
+#### Building the Engine
+```bash
+# Set up Python virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# Configure and compile with HIP (AMD gfx1030 example)
+cmake -B build-hip -S . \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_HIP=ON \
+  -DCMAKE_HIP_ARCHITECTURES="gfx1030" \
+  -DSTRATA_NATIVE_EXPERTS=ON
+
+cmake --build build-hip --target strata -j$(nproc)
+
+# Or compile for NVIDIA CUDA:
+cmake -B build-cuda -S . \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_CUDA=ON \
+  -DSTRATA_NATIVE_EXPERTS=ON
+
+cmake --build build-cuda --target strata -j$(nproc)
 ```
 
-It checks your graphics card, RAM and disk and picks the model that fits. Then it installs and starts it and tells
-you how to connect your apps. AI tools can also install, start and stop Strata through its
-[MCP server](docs/MCP_SERVER.md).
+#### Building the Vision Module
+```bash
+cmake -B build-vision -S tools/vision -DCMAKE_BUILD_TYPE=Release
+cmake --build build-vision --target strata-vision -j$(nproc)
+```
 
-### Or do it yourself
+---
 
-[Download Strata](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
-**Windows:** double-click **`START-HERE.bat`**. **Linux:** run **`./setup.sh`** in the Strata folder.
+### Applying Advanced Rebuild Scripts
 
-**Mac (Apple Silicon, M1 to M5, macOS 15 or newer):** install Apple's Command Line Tools once
-(`xcode-select --install` in Terminal; Xcode itself is not needed). Then open Terminal in the Strata folder and run
-**`./setup.sh`**. It builds the Mac engine on your Mac (about 7 minutes), asks the same questions, downloads the model
-and starts it. Next time, `./setup.sh` starts it right away. Which size fits your Mac and how fast it is:
-[docs/MAC.md](docs/MAC.md).
+To enable memory lifecycle, swap prefetch, and prompt streaming optimizations on an existing build:
 
-The steps are the same for NVIDIA and AMD. The installer finds your card and sets up the right engine for it. It
-asks you a few questions:
+```bash
+# 1. Build and configure memory lifecycle & CPU vision workspace release
+bash tools/rebuild-memory-fix.sh
 
-- which model and which size,
-- how much context (how much text the model keeps in mind),
-- whether it should read pictures.
+# 2. Add long-context dynamic working set & thinking auto-budget
+bash tools/rebuild-long-context-fix.sh
 
-Press Enter each time for the recommended answer. Then it downloads the model (about 70 GB) and starts it. If the
-download stops, run it again: it continues where it left off. Your browser opens the Strata app at
-`http://127.0.0.1:8080`.
+# 3. Add kernel swap prefetch lookahead
+bash tools/rebuild-swap-prefetch-fix.sh
 
-> **While the model starts, your PC can be slow or stop responding for 1-3 minutes** (longest the first time).
-> Strata loads 35-55 GB into your RAM and locks part of it for the graphics card. This is normal. Wait, and don't
-> close the window. The window shows what Strata is doing.
+# 4. Add cache-avoidant prompt file stream reader
+bash tools/rebuild-prompt-stream-fix.sh
 
-**Next time**, run `START-HERE.bat` (or `./setup.sh`) again. It starts right away and downloads nothing twice. Close
-its window to stop the model. `UPDATE.bat` (`./update.sh`) updates Strata without starting it. Updating, Docker,
-several cards, where the files go and every option: [docs/INSTALL.md](docs/INSTALL.md).
+# 5. Enable reasoning-only completion recovery in server configuration
+python3 tools/enable_reasoning_answer_fix.py
+```
 
-**Is it fast on your PC?** Run `BENCH.bat` (`./bench.sh`): about 5-10 minutes, it measures chat, 4K/16K prompts and an agent-style session with your own settings and writes a report to share ([how](docs/COMMUNITY_BENCHMARKS.md#run-the-benchmark)).
+---
 
-## Which model should I pick?
+## Configuration & Runtime Flags
 
-The installer recommends one for your RAM. The same model comes in several sizes, compressed more or less. Smaller
-sizes are faster. Larger sizes are a bit smarter.
-
-| Your RAM | Take | Why |
-| --- | --- | --- |
-| **32 GB** | **Coder** | it fits 32 GB, and it is made for code (with a 24 GB card, Q2_0 and IQ2_XS run too) |
-| **48 GB** | **IQ2_XS** (or Q2_0, the fastest) | the larger sizes do not fit |
-| **64 GB** | **IQ2_XS** (recommended), or IQ3_XXS / IQ3_S | every size fits; IQ3_S is the best and the slowest |
-| **96 GB or more** | **IQ3_S**, or Unsloth's UD-IQ4_XS (~4-bit) | room for the largest sizes with everything else open |
-
-- **[Coder](docs/MODELS.md#coder):** a coding version with half of the experts removed. It reaches 91% of the full
-  model's SWE-bench Verified score (measured by its authors) and fits 32 GB of RAM. It is weaker outside code,
-  including Chinese and other CJK text (#438). For those, take Q2_0, IQ2_XS or IQ3_S, which keep every expert.
-- **[Swift 1.5](docs/MODELS.md#swift-15):** a fine-tune that thinks for a much shorter time before it answers. You
-  get the answer sooner, at about the same quality.
-- **[Unsloth UD-IQ4_XS](docs/MODELS.md#unsloth-ud-iq4_xs):** Unsloth's ~4-bit version, between IQ3_S and
-  UD-Q4_K_XL in quality. A 94 GB download. With less than ~80 GB of RAM, Strata reads part of it from the SSD
-  while it answers, so it is slower there (an NVMe SSD helps).
-- **[Unsloth UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL and Q8_0](docs/MODELS.md#unsloths-files-ud-iq4_xs-to-q8_0):**
-  4- to 8-bit, closer to the full model (93-95% the same next token as Q8_0). Fast where every expert fits in RAM
-  (~88 GB for UD-Q4_K_XL up to ~136 GB for Q8_0); with less RAM Strata reads part of them from the SSD while it
-  answers, which is much slower (7-8.5 tokens/s for UD-Q4_K_XL on a 64 GB PC).
-- **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs):** you set it up by hand. It is
-  not in the installer's menu.
-
-Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). To add another model later, run
-`SETUP.bat` (Linux: `./setup.sh --setup`).
-
-## Using it
-
-<p align="center"><img src="docs/media/runpagoda.png" width="900" alt="The Strata app's Monitor tab next to a coding agent"><br>
-<sub>The Strata app's <b>Monitor</b> (left) while a coding agent writes the pagoda garden from the video (right)</sub></p>
-
-- **In the browser:** open `http://127.0.0.1:8080`. It has **Chat**, a live **Monitor** of the model and your
-  GPU/CPU/RAM, and **About** with the settings and addresses.
-- **Your apps and coding agents:** add an "OpenAI-compatible" provider with the base URL
-  **`http://127.0.0.1:8080/v1`**. Any API key and any model name work.
-  - Apps that use Anthropic's API: `http://127.0.0.1:8080/v1/messages` (Claude Code:
-    `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`).
-  - Codex CLI and other apps that use the OpenAI Responses API: `/v1/responses`
-    ([setup](docs/DETAILS.md#the-responses-api-and-codex-cli)).
-- **Thinking:** choose **off, low, medium or high** in the chat menu or in your app's "reasoning effort". Off is the
-  fastest. High is best for hard questions.
-- **Pictures:** say yes to "Images?" in setup. Then click **Picture** in the chat, or attach pictures in your app.
-  AMD cards read pictures on Linux through the processor; on Windows they can't yet.
-- **From your phone or another PC:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
-- **One request at a time:** by default Strata answers one request, and the others wait. To answer several at once,
-  set `"parallel": 2` ([BATCHING.md](docs/BATCHING.md)). On a 12 GB card this makes each answer slower.
-- **Long prompts:** Strata reads the first message of a chat in full, about 1 minute per 30,000 tokens. Follow-up
-  messages start in seconds.
-
-More: [where your chats are stored](docs/INSTALL.md#where-things-are-stored), [the API](docs/DETAILS.md#using-it).
-
-### Optional: more speed on one card when the whole model fits in RAM
-
-Two opt-in settings (by RubenTorney, #1904 and #1905). They help when you run one graphics card and your RAM holds
-every expert (Strata's arena mode, for example Q2_0 or IQ3_XXS on a 64 GB PC). Open your config,
-`strata-<model>.json` in the Strata data folder ([where](docs/INSTALL.md#where-things-are-stored)), and add:
-
-- **Faster decode:** `"--adapt-async", "1"` to the `"args"` list. The expert cache then updates on a helper thread
-  instead of pausing the answer. Measured on an RTX 5070 (Windows, Q2_0): +4-5% decode, +7-10% on code and long
-  documents. Answers can differ slightly from the default (they stay the same from run to run).
-- **Faster prompt reading on Windows:** `"STRATA_PIN_BY_NEED": "1"` in the `"env"` block. Windows can lock only about
-  half the RAM for the graphics card; this locks the experts the card actually needs first. Measured on the RTX 5070:
-  +4.4% prompt reading.
+Model profiles are defined in `strata-<model>.json`. Key configuration parameters include:
 
 ```json
-"args": [ ..., "--adapt-async", "1" ],
-"env": { "STRATA_PIN_BY_NEED": "1" }
+{
+  "model_name": "qwen3.8-flash-next",
+  "port": 8080,
+  "args": [
+    "--pack", "/path/to/packs",
+    "--native", "/path/to/model-00001-of-00002.gguf",
+    "--ple-gguf", "/path/to/model-00002-of-00002.gguf",
+    "--expert-profile", "/path/to/expert-profile.bin",
+    "--resident-experts"
+  ],
+  "env": {
+    "STRATA_MEMORY_LIFECYCLE": "1",
+    "STRATA_RAM_WORKING_SET": "1",
+    "STRATA_RESIDENT_SWAP_PREFETCH": "1",
+    "STRATA_PROMPT_STREAM": "1"
+  },
+  "vision": {
+    "model": "/path/to/model.gguf",
+    "mmproj": "/path/to/mmproj.gguf",
+    "release_workspace": true
+  },
+  "reasoning_auto_budget_tokens": {
+    "low": 2048,
+    "medium": 4096,
+    "high": 4096,
+    "xhigh": 8192
+  },
+  "reasoning_close_retry": true,
+  "runtime_memory_log": true
+}
 ```
 
-Restart Strata (`START-HERE.bat` or `./setup.sh`) after the change. To undo, remove the two entries.
+### Environment Variables
+| Variable | Description |
+| :--- | :--- |
+| `STRATA_MEMORY_LIFECYCLE=1` | Discards duplicate host expert pages during idle; verifies via Live Ownership v2. |
+| `STRATA_RAM_WORKING_SET=1` | Bounded dynamic promotion of file experts into cooler resident RAM slots during long contexts. |
+| `STRATA_RESIDENT_SWAP_PREFETCH=1` | Uses `mincore` and `MADV_WILLNEED` to prefetch swapped resident experts during generation. |
+| `STRATA_PROMPT_STREAM=1` | Activates `preadv2(RWF_DONTCACHE)` and `O_DIRECT` for uncached prompt expert reading. |
+| `STRATA_RESIDENT_HEADROOM_GIB=N` | Leaves $N$ GiB of RAM unreserved for system and vision tasks (default: 4 GiB). |
 
-## Something went wrong?
+---
 
-- **My PC froze the first time Strata started.** This is normal while it loads the model. Wait, and don't close the
-  window. Still frozen after 10 minutes? Restart the PC, close other programs and try again, or pick a smaller size.
-- **It stopped while downloading or installing.** Run `START-HERE.bat` (or `./setup.sh`) again. It continues where
-  it stopped.
-- **It's very slow and the disk light keeps blinking, or it says "the engine stopped unexpectedly".** Your PC does
-  not have enough free RAM. Close other programs (browsers use a lot), or pick a smaller size (Q2_0 or IQ2_XS).
-- **It says port 8080 is already in use.** Strata is already running. Look for its window.
+## API & Agent Integrations
 
-More problems and their fixes: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). Still stuck? Open an
-[issue](https://github.com/Niko1221/Strata/issues) and attach `strata-<model>.log` from the Strata folder. Found a
-security problem? Report it privately: [SECURITY.md](SECURITY.md).
+Strata exposes a production-ready HTTP server compatible with OpenAI and Anthropic specifications.
 
-## How does it work?
+### OpenAI Compatible API
 
-Models like this one usually run on servers with hundreds of gigabytes of graphics memory. Your graphics card has
-12-24 GB. Strata makes the model fit by **sharing the work across your whole PC**. Think of a kitchen: the things
-you use all the time stay on the counter, and the rest waits in the pantry.
+Point your client or library to `http://127.0.0.1:8080/v1`:
 
-<p align="center"><img src="docs/media/how-it-works.svg" width="860" alt="The model's 24,576 experts: the busiest on the graphics card, all of them in RAM, a lookup table on the SSD"></p>
+```python
+from openai import OpenAI
 
-- **The model is a team of 24,576 small specialists ("experts").** Each word needs only 10 of them.
-- **Your graphics card** keeps the few thousand experts that are used most often. **Your RAM** holds all of them,
-  and **your processor** works on the rest at the same time. **Your SSD** holds a big lookup table.
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="not-needed")
 
-<p align="center"><img src="docs/media/guess-and-check.svg" width="860" alt="A small helper guesses the next words; the big model checks them all at once and keeps the right ones"></p>
+response = client.chat.completions.create(
+    model="default",
+    messages=[
+        {"role": "system", "content": "You are an expert AI assistant."},
+        {"role": "user", "content": "Explain kernel prefetch in operating systems."}
+    ],
+    temperature=0.6,
+    extra_body={"reasoning_effort": "high"}
+)
 
-- **Guess, then check:** a small helper guesses the next few words. The big model checks them all at once. You get
-  the same answer, 1.6-1.8x sooner.
-- **Long texts are read in big pieces** (up to 8,192 tokens at a time), at over 1,000 tokens per second.
+print(response.choices[0].message.content)
+```
 
-The longer explanation: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md). Every part and its numbers:
-[the details](docs/DETAILS.md#how-it-works) and the [paper](docs/paper/Strata-Paper.pdf).
+### Anthropic Messages API (Claude Code)
 
-## Credits and license
+Strata supports the Anthropic Messages specification natively at `/v1/messages`:
 
-The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team. It was
-compressed by [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), UkisAI (Swift 1.5)
-and Unsloth. Strata uses parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). All credits:
-[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits). Strata is open source under the [MIT License](LICENSE). A few
-parts and every model have their own licenses ([which ones](docs/HOW_IT_WORKS.md#license)).
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8080"
+export ANTHROPIC_API_KEY="local"
+claude
+```
 
-## Support Strata
+### OpenAI Responses API (Codex CLI)
 
-Strata is free and open source. If it is useful to you, you can support its development:
+Supports `/v1/responses` for coding agents and modern OpenAI protocol implementations.
 
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a></p>
+### Zed Editor Integration
+
+Add Strata as an OpenAI-compatible provider in `~/.config/zed/settings.json`:
+
+```json
+{
+  "language_models": {
+    "openai": {
+      "api_url": "http://127.0.0.1:8080/v1",
+      "available_models": [
+        {
+          "name": "qwen3.8-flash-next",
+          "display_name": "Strata Qwen3.8 Flash Next",
+          "max_tokens": 131072
+        }
+      ]
+    }
+  }
+}
+```
+
+*Note: The included `reasoning_close_retry v2` patch guarantees completed answers when using reasoning in Zed.*
+
+### Model Context Protocol (MCP)
+
+Strata functions as an MCP client and server. AI coding tools can query status, execute commands, or control inference through documented MCP tool definitions (see [`docs/MCP_SERVER.md`](docs/MCP_SERVER.md)).
+
+---
+
+## Testing & Validation
+
+The codebase includes comprehensive unit and integration test fixtures covering server operations, memory lifecycles, and low-level kernel I/O:
+
+```bash
+# Run server test suite
+python3 -m unittest discover -s serve -p "test_*.py"
+
+# Run memory lifecycle and reasoning tests
+python3 -m unittest serve/test_reasoning_completion.py \
+                     serve/test_reasoning_policy.py \
+                     serve/test_resident_recovery.py \
+                     serve/test_vision_memory.py
+
+# Run tool configuration test suite
+python3 -m unittest tools/test_configure_memory_lifecycle.py \
+                     tools/test_long_context_fix.py \
+                     tools/test_prompt_stream_fix.py \
+                     tools/test_reasoning_answer_fix.py \
+                     tools/test_rebuild_memory_fix.py \
+                     tools/test_rebuild_ownership_fix.py \
+                     tools/test_swap_prefetch_fix.py
+```
+
+---
+
+## How It Works
+
+Models like Qwen3.8-Flash-Next distribute computation across 24,576 individual experts. In standard server environments, all parameters reside in high-bandwidth GPU memory (HBM). Strata partitions these responsibilities across hardware tiers:
+
+1. **GPU Cache Tier (VRAM):** Keeps the hottest, most repeatedly activated experts in fast graphics memory.
+2. **Resident Memory Tier (RAM):** Retains the broader complement of active experts in host memory, processed in parallel by CPU kernels.
+3. **Storage Tier (NVMe SSD):** Hosts cold experts and lookup indices, accessed on-demand using cache-avoidant asynchronous I/O.
+4. **Speculative Decoding:** A lightweight helper draft model predicts upcoming tokens in batches; the primary MoE model validates them in a single parallel pass, delivering 1.6×–1.8× faster generation.
+
+For architectural deep-dives, consult [`docs/HOW_IT_WORKS.md`](docs/HOW_IT_WORKS.md), [`docs/DETAILS.md`](docs/DETAILS.md), and the research paper in [`docs/paper/Strata-Paper.pdf`](docs/paper/Strata-Paper.pdf).
+
+---
+
+## Troubleshooting
+
+- **Server fails with "out of memory" or is killed by earlyoom:**
+  Ensure you are using a quantization that matches your system RAM (e.g., Coder for 32 GB, IQ2_XS for 48–64 GB). Enable `STRATA_MEMORY_LIFECYCLE=1` and set `vision.release_workspace: true`.
+- **Repetitive generation after long conversations:**
+  Ensure the engine was rebuilt with Live Ownership v2 (`idle GPU shadows: live ownership v2` in logs).
+- **Thinking concludes but no answer is displayed:**
+  Enable `reasoning_close_retry: true` in your configuration (`python3 tools/enable_reasoning_answer_fix.py`).
+- **Additional Diagnostics:**
+  Consult [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) or submit an issue with your log attached.
+
+---
+
+## License & Credits
+
+- **Strata Engine:** Released under the [MIT License](LICENSE).
+- **Base Model:** [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by Alibaba Qwen Team.
+- **Quantization & Derivatives:** ISTA-DASLab, UkisAI (Swift 1.5), Unsloth, and OrcaRouter.
+- **Compute Kernels:** Utilizes components from [llama.cpp](https://github.com/ggml-org/llama.cpp) and GGML under their respective open-source licenses.

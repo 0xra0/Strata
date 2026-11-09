@@ -1,0 +1,795 @@
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -160,8 +160,9 @@
+ ANSWER_ROOM_MIN_CAP = 1024    # 0.1.45: from this max_tokens on, thinking without a budget is closed early enough to leave room to answer
+ ANSWER_RESERVE_MIN = 512      # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
+ # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
+-# #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
+-# and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
++# Opt-in reasoning_close_retry v2: a reasoning-only natural stop is continued once,
++# including a stop immediately after </think>. Calls already waiting for final
++# parsing are preserved. Another empty stop is an error rather than empty success.
+ REASONING_CLOSE = "\n</think>\n\n"
+ REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
+ # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
+@@ -349,6 +350,10 @@
+     engine wrote none of that window's tokens and drops every cached state that may carry the poison, so its next
+     request reads the prompt from token 0.  Service.run sends a request that had produced nothing yet once more, and
+     ends one that had started (as "length").  A ValueError, so a stream that has started reports it as an error event."""
++
++
++class IncompleteAnswer(ValueError):
++    """The engine completed reasoning but supplied no answer after one bounded continuation; it is still running."""
+ 
+ 
+ class SessionRefused(ValueError):
+@@ -3143,7 +3148,7 @@
+         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
+         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
+         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
+-        self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
++        self.reasoning_close_retry = False            # opt-in: finish a reasoning-only natural stop once
+         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
+         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
+         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
+@@ -4238,6 +4243,18 @@
+             try:
+                 with open(path, "a", encoding="utf-8") as f:
+                     f.write(line + "\n")
++            except OSError:
++                pass
++
++    def _reasoning_completion_note(self, message):
++        """Keep a bounded, prompt-free recovery note beside the native DONE records."""
++        note = "[strata] reasoning-only completion: " + message
++        print(note, flush=True)
++        path = getattr(self.engine, "log_path", None)
++        if path:
++            try:
++                with open(path, "a", encoding="utf-8") as output:
++                    output.write(note + "\n")
+             except OSError:
+                 pass
+ 
+@@ -4397,6 +4414,10 @@
+                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
+                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
+                                   max_tokens=max_new, reasoning_recoveries=0, thinking_budget=budget)
++                        if self.reasoning_close_retry:
++                            st["reasoning_answer_retries"] = 0
++                        else:
++                            st.pop("reasoning_answer_retries", None)
+                         if par:
+                             self.live_reqs[id(st)] = (st, rate)
+                             self.status.update(st)
+@@ -4455,7 +4476,7 @@
+                                 for ev in evs:
+                                     if self.reasoning_loop_recovery and ev.kind == "reasoning":
+                                         reasoning_text += ev.text or ""
+-                                    if ev.kind in ("content", "tool_start", "tool_call"):
++                                    if (ev.kind == "content" and (ev.text or "").strip()) or ev.kind in ("tool_start", "tool_call"):
+                                         answered = True
+                                     yield "event", ev
+                                 if evs:
+@@ -4559,28 +4580,46 @@
+                                   f"(coverage={repeat_coverage:.3f}); resuming the same output with the low-effort "
+                                   "instruction (reasoning_loop_recovery)", flush=True)
+                             continue
+-                        if (self.reasoning_close_retry and thinking and finish == "stop" and not close_retried
+-                                and not answered and not wrap and not opens and parser.state == "reasoning"
+-                                and parser.buf != THINK_END         # #537: not after a held </think>, the end
+-                                and (stops is None or stops.hit is None) and not cancel.is_set()):
+-                            # #1053: the model wrote its reasoning and stopped before </think>: the client would get
+-                            # an empty answer.  Close the thinking once and let it answer.
++                        retry_suffix = None
++                        if parser.state == "reasoning":
++                            # A held end tag belongs to the model's output already:
++                            # a newline settles it; another </think> would be text.
++                            retry_suffix = "\n\n" if parser.buf == THINK_END else REASONING_CLOSE
++                        elif parser.state == "content" and not parser.buf.strip():
++                            retry_suffix = "\n" * (2 - (len(tail) - len(tail.rstrip("\n"))))
++                        if (self.reasoning_close_retry and thinking and thinking_n and finish == "stop"
++                                and not answered and not wrap and not opens and retry_suffix is not None
++                                and not any(call is not None for _, call in parser.pending)
++                                and (stops is None or (stops.hit is None and not stops.held.strip()))
++                                and not cancel.is_set()):
++                            if close_retried:
++                                finish = "error"
++                                self._reasoning_completion_note("no answer after one continuation; returning an error "
++                                                                "(reasoning_close_retry v2)")
++                                raise IncompleteAnswer("reasoning-only completion: the model supplied no answer or "
++                                                       "tool call after one continuation; the engine is still loaded")
++                            extra = self.tok.encode(retry_suffix + (force or ""), parse_special=True)
++                            if max_new - n - len(extra) < 1:
++                                finish = "length"       # honor the original cap; no hidden extra generation
++                                break
+                             close_retried = True
+-                            extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
+-                            if max_new - n - len(extra) >= 1:
+-                                print("[strata] the reply ended inside its thinking with no answer: closing the "
+-                                      "thinking once and continuing (reasoning_close_retry)", flush=True)
+-                                for t in extra:
+-                                    n += 1
+-                                    raw_ids.append(t)
+-                                    thinking_n += parser.state in ("reasoning", "rcall")
+-                                    evs = cut(parser.feed(detok.push(t)))
+-                                    self._note(n, evs, st, rate)
+-                                    for ev in evs:
+-                                        yield "event", ev
+-                                prompt = prompt + seg + extra
+-                                finish = "length"
+-                                continue
++                            force = None
++                            with self.status_lock:
++                                st["reasoning_answer_retries"] = 1
++                                st["thinking_budget"] = None
++                            self._reasoning_completion_note("continuing once to an answer or tool call "
++                                                            "(reasoning_close_retry v2)")
++                            for t in extra:
++                                n += 1
++                                raw_ids.append(t)
++                                thinking_n += parser.state in ("reasoning", "rcall")
++                                evs = cut(parser.feed(detok.push(t)))
++                                self._note(n, evs, st, rate)
++                                for ev in evs:
++                                    yield "event", ev
++                            prompt = prompt + seg + extra
++                            finish = "length"
++                            continue
+                         if not (wrap or opens) or cancel.is_set():
+                             break
+                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
+@@ -4650,6 +4689,7 @@
+                                 # the request's whole prompt, and the tokens read of it (None: an older engine)
+                                 "prompt_total": len(ids), "prompt_read": last.get("prompt_read"),
+                                 "reasoning_recoveries": recovery_count,
++                                **({"reasoning_answer_retries": int(close_retried)} if self.reasoning_close_retry else {}),
+                                 "reasoning_repeat_coverage": round(repeat_coverage, 3),
+                                 "engine_generated": last.get("generated"),
+                                 "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
+@@ -4716,7 +4756,8 @@
+             yield "event", Event("content", stops.flush())     # the held tail was not a stop string after all
+         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
+                 "timings": timings, "reasoning_tokens": thinking_n,
+-                "reasoning_recoveries": recovery_count}
++                "reasoning_recoveries": recovery_count,
++                **({"reasoning_answer_retries": int(close_retried)} if self.reasoning_close_retry else {})}
+         if stops is not None and stops.hit is not None:
+             done["stop_sequence"] = stops.hit
+         yield "done", done
+@@ -5722,6 +5763,8 @@
+                     self._images(req)
+                 else:
+                     self._json(404, {"error": {"message": "not found"}})
++            except IncompleteAnswer as e:
++                self._json(502, {"error": {"type": "server_error", "code": "reasoning_only_completion", "message": str(e)}})
+             except EngineNonFinite as e:                    # #879, twice: not the request's fault
+                 print(f"[strata] 503: {e}", flush=True)
+                 self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
+@@ -6131,6 +6174,8 @@
+                                                                 code="server_error"))
+                 except EngineNonFinite as e:                 # #879, twice: not the request's fault
+                     return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
++                except IncompleteAnswer as e:
++                    return self._json(502, responses_error_body(str(e), "server_error", code="reasoning_only_completion"))
+                 except ValueError as e:                      # the engine's ERR line
+                     return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
+                 return self._json(200, result)
+@@ -7027,6 +7072,8 @@
+     svc.answer_room = cfg.get("answer_room") is not False
+     svc.runtime_memory_log = cfg.get("runtime_memory_log") is True
+     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
++    if svc.reasoning_close_retry:
++        print("[strata] reasoning-only completion recovery enabled (reasoning_close_retry v2)", flush=True)
+     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
+         icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
+                     if k in ("exe", "diffusion_model", "vae", "llm", "out_dir") and isinstance(v, str)
+--- a/serve/test_server.py
++++ b/serve/test_server.py
+@@ -3936,13 +3936,13 @@
+         self.assertEqual(len(self.engine.prompts), 1)
+         self.assertEqual(c["message"]["content"], "Fine.")
+ 
+-    def test_a_reply_that_closed_its_thinking_right_after_a_quote_is_not_touched(self):
++    def test_a_reply_that_closed_its_thinking_right_after_a_quote_still_gets_an_answer(self):
+         # #537: that </think> waits for the character after it; the end of the turn makes it the end of the thinking
+         self.svc.reasoning_close_retry = True
+         self.engine.THOUGHT = 'two plus two is "4"</think>'
+         c = self.chat()
+-        self.assertEqual(len(self.engine.prompts), 1)
+-        self.assertFalse(c["message"].get("content"))
++        self.assertEqual(len(self.engine.prompts), 2)
++        self.assertEqual(c["message"]["content"], EndsInsideThinkingEngine.ANSWER)
+         self.assertEqual(c["message"]["reasoning_content"], 'two plus two is "4"')
+ 
+ 
+--- /dev/null
++++ b/serve/test_reasoning_completion.py
+@@ -0,0 +1,315 @@
++"""Reasoning-only natural stops through the same HTTP stream used by Zed."""
++import json
++from pathlib import Path
++import unittest
++import urllib.error
++import urllib.request
++
++from serve.frontend import ChatTemplate
++from serve.server import ByteTokenizer, MockEngine, Service, serve
++
++
++TOOL = {"type": "function", "function": {"name": "read_file", "parameters": {
++    "type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}
++CALL = "<tool_call>\n<function=read_file>\n<parameter=path>README.md</parameter>\n</function>\n</tool_call>"
++
++
++class StoppedReasoningEngine(MockEngine):
++    def __init__(self, tok):
++        super().__init__(tok, "unused", max_context=131072)
++        self.parts = ['I checked the result: "ready"</think>', 'The work is complete.']
++        self.prompts, self.samplings = [], []
++        self.cancel_at = None
++
++    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
++        index = len(self.prompts)
++        self.prompts.append(list(ids)); self.samplings.append(dict(sampling or {}))
++        text = self.parts[min(index, len(self.parts) - 1)]
++        tokens = (self.tok.encode(text, parse_special=True) + self.tok.encode('<|im_end|>', parse_special=True))[:max_new]
++        generated, stopped = 0, False
++        try:
++            for token in tokens:
++                if cancel.is_set(): return
++                generated += 1
++                if self.cancel_at == (index, generated): cancel.set()
++                stopped = token in self.tok.encode('<|im_end|>', parse_special=True)
++                yield token
++        finally:
++            self.last = dict(prompt_tokens=len(ids), generated=generated,
++                             reused=3 if not index else len(ids) - 1,
++                             prompt_read=len(ids) - 3 if not index else 1,
++                             prompt_ms=10.0, decode_ms=20.0, finish='stop' if stopped else 'length')
++
++
++class ReasoningCompletion(unittest.TestCase):
++    def setUp(self):
++        self.tok = ByteTokenizer(); self.engine = StoppedReasoningEngine(self.tok)
++        self.svc = Service(self.engine, self.tok, ChatTemplate(Path(__file__).with_name('chat_template.jinja')))
++        self.svc.reasoning_close_retry = True
++        self.svc.reasoning_auto_budget_tokens = 4096
++        self.httpd = serve(self.svc, port=0)
++        self.base = f'http://127.0.0.1:{self.httpd.server_address[1]}'
++
++    def tearDown(self):
++        self.httpd.shutdown(); self.httpd.server_close()
++
++    def post(self, path='/v1/chat/completions', **extra):
++        body = {'model': 'm', 'max_tokens': 768, 'reasoning_effort': 'high',
++                'messages': [{'role': 'user', 'content': 'Finish the work and report the result.'}], **extra}
++        if path == '/v1/responses':
++            body['input'] = 'Finish the work and report the result.'
++            body['max_output_tokens'] = body.pop('max_tokens'); body.pop('messages')
++        request = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
++                                         headers={'Content-Type': 'application/json', 'anthropic-version': '2023-06-01'})
++        try: response = urllib.request.urlopen(request, timeout=10)
++        except urllib.error.HTTPError as error: response = error
++        with response:
++            raw = response.read().decode()
++            return response.status, raw if extra.get('stream') else json.loads(raw)
++
++    def test_closed_thinking_without_an_answer_is_continued(self):
++        status, body = self.post()
++        self.assertEqual(status, 200, body)
++        self.assertEqual(body['choices'][0]['message']['content'], 'The work is complete.')
++        self.assertEqual(len(self.engine.prompts), 2)
++
++    def choice(self, **extra):
++        status, body = self.post(**extra)
++        self.assertEqual(status, 200, body)
++        return body['choices'][0], body
++
++    def test_open_thinking_is_closed_once(self):
++        self.engine.parts[0] = 'Let me look at the output directory.'
++        choice, _ = self.choice()
++        self.assertEqual(choice['message']['content'], self.engine.parts[1])
++        self.assertTrue(self.tok.decode(self.engine.prompts[1]).endswith('</think>\n\n'))
++        self.assertEqual(self.svc.history[-1]['reasoning_answer_retries'], 1)
++
++    def test_closed_and_whitespace_only_content_are_not_answers(self):
++        self.engine.parts[0] = 'Checked.</think>\n\n \n'
++        choice, _ = self.choice()
++        self.assertEqual(choice['message']['content'].strip(), self.engine.parts[1])
++        self.assertEqual(self.tok.decode(self.engine.prompts[1]).count('</think>'), 1)
++
++    def test_unicode_reasoning_is_preserved(self):
++        self.engine.parts[0] = 'Перевірку завершено. 🙂</think>'
++        choice, _ = self.choice()
++        self.assertEqual(choice['message']['reasoning_content'], 'Перевірку завершено. 🙂')
++        self.assertEqual(choice['message']['content'], self.engine.parts[1])
++
++    def test_disabled_policy_preserves_the_original_single_generation(self):
++        self.svc.reasoning_close_retry = False
++        choice, _ = self.choice()
++        self.assertFalse(choice['message']['content'])
++        self.assertEqual(len(self.engine.prompts), 1)
++        self.assertNotIn('reasoning_answer_retries', self.svc.history[-1])
++
++    def test_an_existing_answer_is_not_generated_again(self):
++        self.engine.parts[0] = 'Checked.</think>\n\nAlready done.'
++        choice, _ = self.choice()
++        self.assertEqual(choice['message']['content'], 'Already done.')
++        self.assertEqual(len(self.engine.prompts), 1)
++        self.assertEqual(self.svc.history[-1]['reasoning_answer_retries'], 0)
++
++    def test_thinking_off_is_not_retried(self):
++        self.engine.parts[0] = 'Done.'
++        choice, _ = self.choice(reasoning_effort='none')
++        self.assertEqual(choice['message']['content'], 'Done.')
++        self.assertEqual(len(self.engine.prompts), 1)
++
++    def test_explicit_stop_sequence_is_respected(self):
++        self.engine.parts[0] = 'Checked.</think>\n\nEND'
++        choice, _ = self.choice(stop=['END'])
++        self.assertFalse(choice['message']['content'])
++        self.assertEqual(choice['finish_reason'], 'stop')
++        self.assertEqual(len(self.engine.prompts), 1)
++
++    def test_a_real_answer_held_as_a_partial_stop_sequence_is_not_retried(self):
++        self.engine.parts[0] = 'Checked.</think>\n\nDone.'
++        choice, _ = self.choice(stop=['Done. Later'])
++        self.assertEqual(choice['message']['content'], 'Done.')
++        self.assertEqual(len(self.engine.prompts), 1)
++
++    def test_a_token_limit_is_not_retried(self):
++        self.engine.parts[0] = 'Thinking. ' * 30
++        self.svc.answer_room = False; self.svc.reasoning_auto_budget_tokens = 0
++        choice, body = self.choice(max_tokens=40)
++        self.assertEqual(choice['finish_reason'], 'length')
++        self.assertLessEqual(body['usage']['completion_tokens'], 40)
++        self.assertEqual(len(self.engine.prompts), 1)
++
++    def test_no_extra_budget_is_created_for_the_closing_marker(self):
++        self.engine.parts[0] = 'Checked.'
++        self.svc.answer_room = False; self.svc.reasoning_auto_budget_tokens = 0
++        cap = len(self.tok.encode('Checked.')) + 2
++        choice, body = self.choice(max_tokens=cap)
++        self.assertEqual(choice['finish_reason'], 'length')
++        self.assertLessEqual(body['usage']['completion_tokens'], cap)
++        self.assertEqual(len(self.engine.prompts), 1)
++
++    def test_a_canonical_closed_prefix_needs_no_extra_newlines(self):
++        self.engine.parts[0] = 'Checked.</think>\n\n'
++        self.choice()
++        resumed = self.tok.decode(self.engine.prompts[1])
++        self.assertTrue(resumed.endswith('Checked.</think>\n\n'))
++        self.assertFalse(resumed.endswith('</think>\n\n\n'))
++
++    def test_cancellation_is_not_retried(self):
++        self.engine.cancel_at = (0, 5)
++        self.choice()
++        self.assertEqual(len(self.engine.prompts), 1)
++        self.assertEqual(self.svc.history[-1]['finish'], 'cancel')
++
++    def test_two_empty_stops_are_a_server_error_and_leave_the_engine_usable(self):
++        self.engine.parts[1] = ''
++        status, body = self.post()
++        self.assertEqual(status, 502, body)
++        self.assertEqual(body['error']['code'], 'reasoning_only_completion')
++        self.assertEqual(len(self.engine.prompts), 2)
++        self.assertEqual(self.svc.history[-1]['finish'], 'error')
++        self.assertFalse(self.svc.status['busy'])
++        self.engine.parts.append('Checked.</think>\n\nHealthy.')
++        choice, _ = self.choice()
++        self.assertEqual(choice['message']['content'], 'Healthy.')
++        self.assertEqual(len(self.engine.prompts), 3)
++
++    def test_whitespace_on_the_retry_is_not_success(self):
++        self.engine.parts[1] = '\n \n'
++        status, body = self.post()
++        self.assertEqual(status, 502, body)
++        self.assertEqual(len(self.engine.prompts), 2)
++
++    @staticmethod
++    def events(raw):
++        return [json.loads(line[6:]) for line in raw.splitlines() if line.startswith('data: {')]
++
++    def test_zed_sse_has_one_final_stop_and_one_done_after_the_answer(self):
++        status, raw = self.post(stream=True)
++        self.assertEqual(status, 200, raw)
++        events = self.events(raw)
++        choices = [event['choices'][0] for event in events if event.get('choices')]
++        text = ''.join(c['delta'].get('content', '') for c in choices)
++        self.assertEqual(text, self.engine.parts[1])
++        self.assertEqual([c['finish_reason'] for c in choices if c['finish_reason']], ['stop'])
++        self.assertEqual(raw.count('data: [DONE]'), 1)
++        self.assertEqual(sum(c['delta'].get('role') == 'assistant' for c in choices), 1)
++        self.assertEqual(len(self.engine.prompts), 2)
++
++    def test_sse_reports_error_instead_of_empty_success_after_two_stops(self):
++        self.engine.parts[1] = ''
++        status, raw = self.post(stream=True)
++        self.assertEqual(status, 200, raw)
++        events = self.events(raw)
++        self.assertTrue(any('reasoning-only completion' in e.get('error', {}).get('message', '') for e in events))
++        self.assertFalse(any(c['finish_reason'] == 'stop' for e in events for c in e.get('choices', [])))
++        self.assertEqual(raw.count('data: [DONE]'), 1)
++        self.assertEqual(len(self.engine.prompts), 2)
++
++    def test_pending_calls_inside_reasoning_are_released_once_without_retry(self):
++        self.engine.parts[0] = 'I will read the file.\n' + CALL
++        choice, _ = self.choice(tools=[TOOL])
++        self.assertEqual(choice['finish_reason'], 'tool_calls')
++        self.assertEqual(len(choice['message']['tool_calls']), 1)
++        self.assertEqual(json.loads(choice['message']['tool_calls'][0]['function']['arguments']), {'path': 'README.md'})
++        self.assertEqual(len(self.engine.prompts), 1)
++
++    def test_a_visible_tool_call_is_not_retried(self):
++        self.engine.parts[0] = 'Checked.</think>\n\n' + CALL
++        choice, _ = self.choice(tools=[TOOL])
++        self.assertEqual(choice['finish_reason'], 'tool_calls')
++        self.assertEqual(len(choice['message']['tool_calls']), 1)
++        self.assertEqual(len(self.engine.prompts), 1)
++
++    def test_forced_tool_opening_is_preserved_on_the_continuation(self):
++        self.engine.parts = ['Let me inspect README.', '<parameter=path>README.md</parameter>\n</function>\n</tool_call>']
++        choice, _ = self.choice(tools=[TOOL], tool_choice={'type': 'function', 'function': {'name': 'read_file'}})
++        self.assertEqual(choice['finish_reason'], 'tool_calls')
++        self.assertEqual(json.loads(choice['message']['tool_calls'][0]['function']['arguments']), {'path': 'README.md'})
++        self.assertEqual(len(self.engine.prompts), 2)
++        self.assertIn('</think>\n\n<tool_call>', self.tok.decode(self.engine.prompts[1]))
++
++    def test_sampling_and_original_input_accounting_are_preserved(self):
++        _, body = self.choice(temperature=0, presence_penalty=0, top_p=0.8, top_k=12, seed=42)
++        self.assertEqual(self.engine.samplings[0], self.engine.samplings[1])
++        self.assertEqual(body['usage']['prompt_tokens'], len(self.engine.prompts[0]))
++        self.assertEqual(body['usage']['prompt_tokens_details']['cached_tokens'], 3)
++        self.assertLessEqual(body['usage']['completion_tokens'], 768)
++
++    def test_continuation_uses_the_original_cap(self):
++        self.engine.parts[1] = 'A long answer. ' * 30
++        choice, body = self.choice(max_tokens=100)
++        self.assertEqual(choice['finish_reason'], 'length')
++        self.assertTrue(choice['message']['content'])
++        self.assertEqual(body['usage']['completion_tokens'], 100)
++        self.assertEqual(len(self.engine.prompts), 2)
++
++    def test_anthropic_text_follows_the_thinking(self):
++        status, body = self.post('/v1/messages', thinking={'type': 'enabled', 'budget_tokens': 4096})
++        self.assertEqual(status, 200, body)
++        self.assertEqual(''.join(p.get('text', '') for p in body['content']), self.engine.parts[1])
++        self.assertEqual(body['stop_reason'], 'end_turn')
++        self.assertEqual(len(self.engine.prompts), 2)
++
++    def test_anthropic_stream_finishes_after_text(self):
++        status, raw = self.post('/v1/messages', stream=True, thinking={'type': 'enabled', 'budget_tokens': 4096})
++        self.assertEqual(status, 200, raw)
++        events = self.events(raw)
++        self.assertEqual(''.join(e.get('delta', {}).get('text', '') for e in events), self.engine.parts[1])
++        self.assertEqual(sum(e['type'] == 'message_stop' for e in events), 1)
++
++    def test_responses_has_a_completed_output_text(self):
++        status, body = self.post('/v1/responses', reasoning={'effort': 'high'})
++        self.assertEqual(status, 200, body)
++        self.assertEqual(body['status'], 'completed')
++        self.assertIn(self.engine.parts[1], json.dumps(body))
++        self.assertEqual(len(self.engine.prompts), 2)
++
++    def test_responses_stream_has_one_completion_after_text(self):
++        status, raw = self.post('/v1/responses', stream=True, reasoning={'effort': 'high'})
++        self.assertEqual(status, 200, raw)
++        events = self.events(raw)
++        self.assertEqual(sum(e['type'] == 'response.completed' for e in events), 1)
++        self.assertIn(self.engine.parts[1], raw)
++
++    def test_responses_empty_retry_is_not_a_completed_response(self):
++        self.engine.parts[1] = ''
++        status, body = self.post('/v1/responses', reasoning={'effort': 'high'})
++        self.assertEqual(status, 502, body)
++        self.assertEqual(body['error']['code'], 'reasoning_only_completion')
++
++    def test_responses_stream_reports_failure_after_two_empty_stops(self):
++        self.engine.parts[1] = ''
++        status, raw = self.post('/v1/responses', stream=True, reasoning={'effort': 'high'})
++        self.assertEqual(status, 200, raw)
++        events = self.events(raw)
++        self.assertEqual(sum(e['type'] == 'response.failed' for e in events), 1)
++        self.assertFalse(any(e['type'] == 'response.completed' for e in events))
++
++    def test_anthropic_empty_retry_is_a_server_error(self):
++        self.engine.parts[1] = ''
++        status, body = self.post('/v1/messages', thinking={'type': 'enabled', 'budget_tokens': 4096})
++        self.assertEqual(status, 502, body)
++        self.assertEqual(body['error']['code'], 'reasoning_only_completion')
++
++    def test_anthropic_stream_reports_an_error_after_two_empty_stops(self):
++        self.engine.parts[1] = ''
++        status, raw = self.post('/v1/messages', stream=True, thinking={'type': 'enabled', 'budget_tokens': 4096})
++        self.assertEqual(status, 200, raw)
++        events = self.events(raw)
++        self.assertEqual(sum(e['type'] == 'error' for e in events), 1)
++        self.assertFalse(any(e['type'] == 'message_stop' for e in events))
++
++    def test_recovery_and_failure_are_recorded_in_the_current_engine_log(self):
++        import tempfile
++        self.engine.parts[1] = ''
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / 'engine.log'; self.engine.log_path = str(path)
++            status, _ = self.post()
++            self.assertEqual(status, 502)
++            note = path.read_text()
++            self.assertEqual(note.count('continuing once'), 1)
++            self.assertEqual(note.count('returning an error'), 1)
++            self.assertNotIn('I checked the result', note)
++
++
++if __name__ == '__main__': unittest.main()
+--- /dev/null
++++ b/tools/enable_reasoning_answer_fix.py
+@@ -0,0 +1,47 @@
++#!/usr/bin/env python3
++"""Enable one bounded continuation for a thinking-only completion."""
++import argparse
++import copy
++import json
++import os
++from pathlib import Path
++import shutil
++import tempfile
++import time
++
++
++def enable(path, *, source=None):
++    path = Path(path).resolve()
++    source = Path(source) if source else Path(__file__).resolve().parents[1] / 'serve/server.py'
++    code = source.read_bytes()
++    if b'reasoning_close_retry v2' not in code or b'class IncompleteAnswer' not in code:
++        raise ValueError('Extract the matching server update before enabling the answer fix')
++    before = json.loads(path.read_text())
++    if not isinstance(before, dict): raise ValueError('The config must be a JSON object')
++    after = copy.deepcopy(before)
++    after['reasoning_close_retry'] = True
++    backup = path.with_name(path.name + '.before-reasoning-answer-' + str(time.time_ns()))
++    shutil.copy2(path, backup)
++    fd, temporary = tempfile.mkstemp(prefix='.strata-reasoning-answer-', dir=path.parent)
++    try:
++        with os.fdopen(fd, 'w') as output:
++            json.dump(after, output, indent=2); output.write('\n'); output.flush(); os.fsync(output.fileno())
++        shutil.copymode(path, temporary)
++        os.replace(temporary, path)
++    finally:
++        Path(temporary).unlink(missing_ok=True)
++    return after, backup
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--config', type=Path,
++                        default=Path(__file__).resolve().parents[1] / 'strata-coder-uncen-iq1_m.json')
++    args = parser.parse_args()
++    try:
++        config, backup = enable(args.config)
++    except (OSError, ValueError) as error:
++        parser.exit(1, str(error) + '\n')
++    print('Thinking-only completion recovery enabled (reasoning_close_retry v2).')
++    print('Config backup:', backup)
++    print('Restart run-coder-uncen-iq1_m.sh to load the updated server.')
+--- /dev/null
++++ b/tools/test_reasoning_answer_fix.py
+@@ -0,0 +1,63 @@
++import json
++from pathlib import Path
++import tempfile
++import unittest
++from unittest.mock import patch
++from tools.enable_reasoning_answer_fix import enable
++
++
++class EnableAnswerFix(unittest.TestCase):
++    def fixture(self, directory):
++        root = Path(directory)
++        source = root / 'server.py'; source.write_bytes(b'reasoning_close_retry v2\nclass IncompleteAnswer')
++        config = {'exe': '/mnt/ssd/Strata/engine/strata', 'args': ['--max-context', '131072', '--kv', 'int8', '--spec', '4'],
++                  'env': {'STRATA_RESIDENT_PIN': '0', 'STRATA_RESIDENT_HEADROOM_GIB': '8', 'STRATA_PROMPT_STREAM': '1',
++                          'STRATA_RAM_WORKING_SET': '1', 'STRATA_RESIDENT_SWAP_PREFETCH': '1'},
++                  'reasoning_auto_budget_tokens': 4096, 'reasoning_effort': 'high',
++                  'sampling': {'temperature': 0, 'presence_penalty': 0}, 'vision': {'gpu': False, 'max_tokens': 300}}
++        path = root / 'config.json'; path.write_text(json.dumps(config)); path.chmod(0o600)
++        return source, config, path
++
++    def test_only_the_requested_recovery_flag_changes(self):
++        with tempfile.TemporaryDirectory() as directory:
++            source, before, path = self.fixture(directory)
++            after, backup = enable(path, source=source)
++            self.assertEqual(after, {**before, 'reasoning_close_retry': True})
++            self.assertEqual(json.loads(backup.read_text()), before)
++            self.assertEqual(json.loads(path.read_text()), after)
++            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
++
++    def test_old_server_is_rejected_before_config_or_backups_change(self):
++        with tempfile.TemporaryDirectory() as directory:
++            source, before, path = self.fixture(directory); source.write_text('old server')
++            with self.assertRaises(ValueError): enable(path, source=source)
++            self.assertEqual(json.loads(path.read_text()), before)
++            self.assertEqual(list(path.parent.glob('*.before-reasoning-answer-*')), [])
++
++    def test_invalid_config_is_rejected_before_backups(self):
++        with tempfile.TemporaryDirectory() as directory:
++            source, _, path = self.fixture(directory); path.write_text('[]')
++            with self.assertRaises(ValueError): enable(path, source=source)
++            self.assertEqual(path.read_text(), '[]')
++            self.assertEqual(list(path.parent.glob('*.before-reasoning-answer-*')), [])
++
++    def test_failed_atomic_replace_preserves_the_config_and_cleans_the_tempfile(self):
++        with tempfile.TemporaryDirectory() as directory:
++            source, before, path = self.fixture(directory)
++            with patch('os.replace', side_effect=OSError('fixture replacement failure')):
++                with self.assertRaises(OSError): enable(path, source=source)
++            self.assertEqual(json.loads(path.read_text()), before)
++            self.assertEqual(list(path.parent.glob('.strata-reasoning-answer-*')), [])
++
++    def test_enabling_is_idempotent_and_preserves_an_explicit_token_budget(self):
++        with tempfile.TemporaryDirectory() as directory:
++            source, before, path = self.fixture(directory)
++            before.update(reasoning_budget_tokens=16000, reasoning_close_retry=False)
++            path.write_text(json.dumps(before))
++            first, _ = enable(path, source=source)
++            second, _ = enable(path, source=source)
++            self.assertEqual(first, second)
++            self.assertEqual(second, {**before, 'reasoning_close_retry': True})
++
++
++if __name__ == '__main__': unittest.main()
+--- /dev/null
++++ b/docs/THINKING_ANSWER_FIX.md
+@@ -0,0 +1,92 @@
++# Zed finishes with thinking but no answer
++
++This is a Python server update over the prompt-stream revision. The existing
++engine binary and its memory/performance fixes are retained. No engine rebuild
++is needed.
++
++## Evidence
++
++The attached Zed export has an assistant turn containing only a thinking block.
++It ends with a plan to look at the output directory, then the user asks
++`you done job ?`. The following assistant turn contains the completed summary.
++The native log's corresponding final requests generated 1,713 and 1,695 tokens.
++It does not retain the server's finish reason for the thinking-only turn. The
++screenshot confirms a normal stop for the later summary, but does not prove the
++earlier turn's trigger. Neither the raw SSE nor the model's end delimiter was
++attached. The stop variants below are independently reproduced by HTTP tests.
++
++The translation report now confirms both HTTP requests returned 200 and the
++correct translation. Its repeat generated eight tokens at 20.5 tok/s.
++The latest engine run (PID 3043452, started 2026-10-26 19:54:10) completed 29
++requests, generating 30,244 tokens at a weighted 19.40 tok/s. The final request
++generated 1,695 tokens at 21.2 tok/s with a 64,797-token prompt. The prompt reader
++used RWF_DONTCACHE without fallback/errors. Swap was still nonzero/transient
++(peak sample 4.35 GiB); these observations are not a matched speed benchmark or
++a guarantee against OOM.
++
++## Cause and correction
++
++Strata previously accepted a model EOS during reasoning as a successful `stop`,
++even with no answer or tool call. An optional `reasoning_close_retry` existed,
++but was disabled by default and also excluded a closing tag held by the parser.
++Consequently merely enabling that option did not cover a stop immediately after
++the thinking ended. A local HTTP regression reproduced that exact empty-success
++case before this change.
++
++The corrected `reasoning_close_retry v2`:
++
++- Handles reasoning-only natural stops before the end tag, on a held end tag,
++  or after closing thinking with only whitespace in the answer.
++- Closes thinking only if it is still open. A model-written closing tag is
++  retained, and existing separator newlines are reused.
++- Makes at most one continuation, inside the same API request, using the
++  generated token prefix and the remaining original output allowance.
++- Keeps the HTTP stream open until that continuation supplies the answer or
++  a tool call. There is one final stream completion, not an intermediate stop.
++- Preserves completed/pending tool calls and forced tool selection. It does not
++  retry cancelled requests, explicit stop-string matches, token-limit endings,
++  valid answers held as a partial stop-string match, or calls already in flight.
++- Returns an explicit server error if the model naturally stops empty again.
++  Buffered requests use HTTP 502; an already-started stream uses its normal
++  error event. This does not unload or restart the healthy engine.
++
++Each continuation/error is recorded in the current engine log without prompt
++text. Request history includes `reasoning_answer_retries`. Original input/cache
++accounting and the aggregate completion cap cover both native generations.
++
++The feature remains off by default. The supplied activation helper sets only
++`reasoning_close_retry: true` in the selected profile. Context, model, cache,
++RAM allocation, GPU reserve, thinking budget and sampling are preserved. A valid
++ordinary reply performs one generation; a formerly empty completion incurs one
++additional bounded generation. Its real-model latency and answer quality still
++need checking on the user's hardware.
++
++## Install over the current Strata directory
++
++Stop Strata. Extract Strata-thinking-answer-fix.zip into /mnt/ssd, merging its
++Strata directory into /mnt/ssd/Strata. Then:
++
++```bash
++cd /mnt/ssd/Strata
++python3 tools/enable_reasoning_answer_fix.py
++bash run-coder-uncen-iq1_m.sh
++```
++
++The helper verifies that the matching server code is present, backs up
++strata-coder-uncen-iq1_m.json, and atomically enables the recovery flag. It uses
++only Python's standard library. Another profile can be selected with --config.
++
++Startup prints:
++
++```text
++[strata] reasoning-only completion recovery enabled (reasoning_close_retry v2)
++```
++
++When the model encounters the problematic boundary, the engine log records:
++
++```text
++[strata] reasoning-only completion: continuing once to an answer or tool call (reasoning_close_retry v2)
++```
++
++To disable this recovery, set reasoning_close_retry to false in the profile and
++restart. See THINKING_ANSWER_TEST_RESULTS.txt for the validation and its limits.
+--- /dev/null
++++ b/docs/THINKING_ANSWER_TEST_RESULTS.txt
+@@ -0,0 +1,58 @@
++Thinking-only completion correction, 2026-10-26
++
++BEFORE THE CHANGE
++The new closed-thinking HTTP fixture failed against version 7:
++  expected "The work is complete.", actual content=None, finish_reason=stop.
++The fixture had reasoning_close_retry enabled already, confirming the old
++held-</think> exclusion independently of the default-off setting.
++
++VALIDATION
++202 distinct relevant tests pass across the selected regression set and the
++final boundary/config checks. The initial 198-test regression run passed 197
++and skipped one JSON-schema test because jsonschema was missing. That dependency
++was installed for testing; the skipped test was then run and passed. Four added
++HTTP/logging boundary tests also passed. The final 31-test HTTP boundary module
++passed after the last server change.
++
++Selected regression modules/classes:
++  serve.test_reasoning_completion, tools.test_reasoning_answer_fix,
++  serve.test_server.ReasoningCloseRetry, .ThinkingBudget, .ForcedToolChoice,
++  .StopStrings, serve.test_reasoning_policy, serve.test_reasoning_rescue,
++  serve.test_reasoning_tools, serve.test_reasoning_loop_recovery,
++  serve.test_request_accounting, serve.test_responses, serve.test_fatal_recovery.
++
++The 31 final HTTP tests exercise real local HTTP handlers with a scripted engine:
++  - Open, held-closed, closed and whitespace-only reasoning endings.
++  - Unicode reasoning; original canonical prefix/newlines preserved.
++  - Default-off/single-generation behavior and ordinary valid answers.
++  - Thinking disabled; cancellation; explicit stop sequences; partial stop
++    matches held for later flushing; original token cap and marker-room limits.
++  - One retry maximum, explicit repeated-empty errors, and a healthy next request.
++  - Zed-style OpenAI SSE: one assistant role, answer before one stop and [DONE].
++  - Pending reasoning tool calls, visible calls and forced tool selection, each
++    without duplicate calls or altered arguments.
++  - Unchanged sampling across segments, original prompt/cache accounting.
++  - OpenAI, Anthropic and Responses buffered/streaming successes and failures.
++  - Prompt-free continuation/failure notes in the current engine log.
++
++Five activation-helper tests verify the exact one-flag delta, preservation of
++model args, budgets, sampling, memory flags and vision; backups and permissions;
++old-source/invalid-config rejection; atomic-replace failure cleanup; idempotency.
++
++Python compilation and whitespace checks passed. Existing telemetry ResourceWarnings
++occurred in the suite; no test failed. The update touches no C++/HIP/CUDA/SYCL
++files and needs no GPU engine rebuild.
++
++LIMITS
++Generation is scripted in the host tests, not the user's AMD model. These tests
++validate protocol/state/control-flow behavior, not model quality or GPU speed.
++The attached Zed log supplies the real-model observations in THINKING_ANSWER_FIX.md.
++There was no live access to the user's Strata/Zed processes. A model that remains
++empty after the bounded continuation is reported as an error, not given invented
++answer text. Explicit user stops/cancellation/limits retain their meanings.
++
++PACKAGING
++The delta is against full-project version 7. Its application is checked and the
++changed source bytes are compared. The small archive contains only the explicit
++server/helper/test/docs file list. The full archive retains unrelated entries,
++including the engine binary and previous memory/performance fixes.

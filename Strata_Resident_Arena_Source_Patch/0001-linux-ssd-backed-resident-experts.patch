@@ -1,0 +1,240 @@
+diff --git a/include/strata/core/expert_source.hpp b/include/strata/core/expert_source.hpp
+index 4850b8b6..38a7c5e2 100644
+--- a/include/strata/core/expert_source.hpp
++++ b/include/strata/core/expert_source.hpp
+@@ -993,6 +993,7 @@ private:
+     uint64_t mapped_bytes_ = 0;
+     std::vector<uint64_t> layer_offsets_, layer_blob_bytes_;
+     void* complement_arena_ = nullptr;
++    bool complement_file_backed_ = false;  ///< Linux opt-in: reclaimable SSD-backed pageable expert arena
+     const uint8_t* complement_host_ = nullptr;
+     const uint8_t* complement_device_ = nullptr;
+     uint64_t complement_bytes_ = 0;
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index d3fefeef..60da6560 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include "strata/core/pinned.hpp"
+ #include "strata/platform/memory.hpp"
++#include "strata/platform/file_backed_arena.hpp"
+ #include "strata/kernels/elementwise.hpp"
+ #include "strata/kernels/quantize_act.hpp"
+ #include "strata/kernels/s2_expert_grouped.hpp"
+@@ -1001,6 +1002,10 @@ void FileExpertSource::close() {
+     io_stop();
+     inputs_.clear();
+     if (complement_arena_ != nullptr) {
++#if defined(__linux__)
++        if (complement_file_backed_) strata::platform::release_file_backed_arena(complement_arena_, (size_t) complement_bytes_);
++        else
++#endif
+         if (complement_pinned_ && !complement_registered_) (void) cudaFreeHost(complement_arena_);
+         else {
+             if (complement_registered_) (void) cudaHostUnregister(complement_arena_);
+@@ -1023,6 +1028,7 @@ void FileExpertSource::close() {
+     exchanges_ = 0;
+     file_reads_.store(0);
+     complement_arena_ = nullptr;
++    complement_file_backed_ = false;
+     complement_host_ = nullptr;
+     complement_device_ = nullptr;
+     complement_bytes_ = 0;
+@@ -2862,6 +2868,11 @@ bool FileExpertSource::pin_cache_complement(
+         stage_lent_bytes = bytes - before;
+     }
+ 
++    // Linux optional file-backed pageable complement: the same exact compact expert bytes can be kept in RAM
++    // while memory is available, but the kernel can discard clean pages under pressure and fault them from
++    // a temporary SSD file instead of pushing a ~20 GiB anonymous allocation into zram. Not pinned, not tmpfs.
++    // The disk file is unlinked immediately and disappears automatically when Strata exits or is killed.
++    bool file_backed = false;
+     void* arena = nullptr;
+     const uint8_t* host = nullptr;
+     const uint8_t* device = nullptr;
+@@ -2873,6 +2884,10 @@ bool FileExpertSource::pin_cache_complement(
+     std::string note;
+     auto release = [&]() {
+         if (arena == nullptr) return;
++#if defined(__linux__)
++        if (file_backed) strata::platform::release_file_backed_arena(arena, (size_t) bytes);
++        else
++#endif
+         if (pinned_ok) (void) cudaFreeHost(arena);
+         else {
+             if (partial_pin > 0) (void) cudaHostUnregister(arena);
+@@ -2965,13 +2980,34 @@ bool FileExpertSource::pin_cache_complement(
+                 std::fflush(stderr);
+             }
+             errno = 0;
+-            if (paced) {   // page-aligned: the steps are registered on page boundaries
++#if defined(__linux__)
++            // Opt-in, only for pageable complements. The file must live on a disk filesystem; using /tmp
++            // on tmpfs would put the same pressure back on RAM. A separate, preallocated, unlinked file
++            // is used so the data is private to this engine run and is cleaned up even after SIGKILL.
++            const char* backing_dir = std::getenv("STRATA_RESIDENT_FILE_DIR");
++            if (backing_dir && *backing_dir) {
++                if (pin) {
++                    err = "FileExpertSource: STRATA_RESIDENT_FILE_DIR needs STRATA_RESIDENT_PIN=0 "
++                          "(pinned pages cannot be reclaimed)";
++                    release();
++                    return false;
++                }
++                arena = strata::platform::create_file_backed_arena(backing_dir, (size_t) bytes, err);
++                if (arena == nullptr) { release(); return false; }
++                file_backed = true;
++                std::fprintf(stderr, "FileExpertSource: %.2f GiB pageable complement backed by SSD "
++                                     "(STRATA_RESIDENT_FILE_DIR=%s); startup writes this once; clean expert "
++                                     "pages can be reclaimed without zram swap\n",
++                             (double) bytes / 1073741824.0, backing_dir);
++            }
++#endif
++            if (!file_backed && paced) {   // page-aligned: the steps are registered on page boundaries
+ #if !defined(_WIN32)
+                 void* aligned = nullptr;
+                 const uint64_t page = 4096;
+                 if (posix_memalign(&aligned, (size_t) page, (size_t) ((bytes + page - 1) / page * page)) == 0) arena = aligned;
+ #endif
+-            } else {
++            } else if (!file_backed) {
+                 arena = std::malloc((size_t) bytes);
+             }
+             if (arena == nullptr) {
+@@ -3213,6 +3249,21 @@ bool FileExpertSource::pin_cache_complement(
+         release();
+         return false;
+     }
++#if defined(__linux__)
++    if (file_backed) {
++        // Without a completed writeback the new pages remain dirty and unreclaimable under pressure.
++        // Pay the one-time SSD write here, rather than stalling the first Blender/Loopcut prefill or
++        // swapping anonymous expert pages to zram. Expert pointers and quantized bytes are unchanged.
++        const auto flush_t0 = std::chrono::steady_clock::now();
++        if (!strata::platform::sync_file_backed_arena(arena, (size_t) bytes, err)) {
++            release();
++            return false;
++        }
++        std::fprintf(stderr, "FileExpertSource: SSD-backed complement synced (%.1f s); "
++                             "clean pages are now reclaimable\n",
++                     std::chrono::duration<double>(std::chrono::steady_clock::now() - flush_t0).count());
++    }
++#endif
+ #if defined(_WIN32)
+     // The mapped pages this process touched (the GPU cache's fill and this copy) leave its working set for the
+     // standby list: VirtualUnlock on pages that are not locked does exactly that (it then reports ERROR_NOT_LOCKED).
+@@ -3241,6 +3292,7 @@ bool FileExpertSource::pin_cache_complement(
+     }
+ 
+     complement_arena_ = arena;
++    complement_file_backed_ = file_backed;
+     complement_host_ = host;
+     complement_device_ = device;
+     complement_bytes_ = bytes;
+diff --git a/include/strata/platform/file_backed_arena.hpp b/include/strata/platform/file_backed_arena.hpp
+new file mode 100644
+index 00000000..6cb12750
+--- /dev/null
++++ b/include/strata/platform/file_backed_arena.hpp
+@@ -0,0 +1,69 @@
++// Linux-only SSD-backed pageable arena. When the mapped bytes have been synced, the kernel may
++// reclaim clean expert pages and fault them from disk instead of swapping an anonymous copy.
++// This is a latency/memory-pressure tradeoff, not a RAM expansion or a guarantee of unchanged speed.
++#pragma once
++
++#include <cstddef>
++#include <string>
++
++#if defined(__linux__)
++#include <cerrno>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fcntl.h>
++#include <linux/magic.h>
++#include <sys/mman.h>
++#include <sys/vfs.h>
++#include <unistd.h>
++#include <vector>
++
++namespace strata::platform {
++
++inline void* create_file_backed_arena(const char* dir, size_t bytes, std::string& err) {
++    if (dir == nullptr || !*dir || bytes == 0) {
++        err = "SSD-backed resident arena requires a nonempty disk directory and nonzero size";
++        return nullptr;
++    }
++    struct statfs fs{};
++    if (statfs(dir, &fs) != 0 || fs.f_type == TMPFS_MAGIC || fs.f_type == RAMFS_MAGIC) {
++        err = "SSD-backed resident arena requires an existing disk directory (not tmpfs): " + std::string(dir);
++        return nullptr;
++    }
++    const std::string pattern = std::string(dir) + "/.strata-resident-XXXXXX";
++    std::vector<char> path(pattern.begin(), pattern.end());
++    path.push_back('\0');
++    const int fd = mkstemp(path.data());
++    if (fd < 0) {
++        err = "Cannot create SSD-backed resident arena: " + std::string(std::strerror(errno));
++        return nullptr;
++    }
++    // Unlink immediately, so a SIGKILL or an engine crash cannot leave a 20+ GiB orphan file.
++    (void) unlink(path.data());
++    // Reserve all extents to prevent SIGBUS from late ENOSPC while decoding.
++    const int allocation_error = posix_fallocate(fd, 0, (off_t) bytes);
++    void* view = MAP_FAILED;
++    if (allocation_error == 0)
++        view = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    const int mapping_error = errno;
++    (void) ::close(fd);
++    if (view == MAP_FAILED) {
++        err = "Cannot allocate SSD-backed resident arena (need sufficient free disk space): " +
++              std::string(std::strerror(allocation_error ? allocation_error : mapping_error));
++        return nullptr;
++    }
++    return view;
++}
++
++inline bool sync_file_backed_arena(void* p, size_t bytes, std::string& err) {
++    if (msync(p, bytes, MS_SYNC) == 0) return true;
++    err = "Cannot sync resident arena to disk: " + std::string(std::strerror(errno));
++    return false;
++}
++
++inline void release_file_backed_arena(void* p, size_t bytes) {
++    if (p != nullptr) (void) munmap(p, bytes);
++}
++
++}  // namespace strata::platform
++#endif
+diff --git a/tools/tests/test_file_backed_arena.cpp b/tools/tests/test_file_backed_arena.cpp
+new file mode 100644
+index 00000000..71fd00ed
+--- /dev/null
++++ b/tools/tests/test_file_backed_arena.cpp
+@@ -0,0 +1,26 @@
++// Standalone Linux test: c++ -std=c++17 -Iinclude tools/tests/test_file_backed_arena.cpp -o /tmp/test-file-arena
++#include "strata/platform/file_backed_arena.hpp"
++#include <cassert>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <sys/mman.h>
++#include <unistd.h>
++
++int main(int argc, char** argv) {
++    assert(argc == 2);  // pass an SSD-backed directory, NOT /dev/shm
++    std::string err;
++    constexpr size_t n = 256 * 1024;
++    auto* p = static_cast<unsigned char*>(strata::platform::create_file_backed_arena(argv[1], n, err));
++    if (!p) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
++    for (size_t i = 0; i < n; ++i) p[i] = (unsigned char) (i * 7);
++    assert(strata::platform::sync_file_backed_arena(p, n, err));
++    assert(madvise(p, n, MADV_DONTNEED) == 0);
++    for (size_t i = 0; i < n; ++i) assert(p[i] == (unsigned char) (i * 7));
++    strata::platform::release_file_backed_arena(p, n);
++    err.clear();
++    assert(strata::platform::create_file_backed_arena("/dev/shm", n, err) == nullptr);
++    assert(!err.empty());
++    std::puts("file-backed resident arena: 3 checks passed (persist/reclaim/deny tmpfs)");
++    return 0;
++}

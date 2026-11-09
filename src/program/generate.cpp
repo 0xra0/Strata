@@ -25,6 +25,7 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
+#include "strata/core/vision_records.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
@@ -69,6 +70,7 @@
 #include "strata/program/batch_read.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/ram_working_set.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/prefill/share_rules.hpp"
 #include "strata/platform/host_limits.hpp"
@@ -7752,7 +7754,7 @@ int main(int argc, char** argv) {
                          (double) src.resident_bytes() / 1073741824.0,
                          src.complement_pinned() ? "page-locked" : src.locked_bytes() > 0 ? "locked" : "pageable",
                          (long long) xcache.resident(),
-                         o.adapt_every > 0 && o.adapt_swaps > 0 ? "exchange them with the GPU cache (no file reads)"
+                         o.adapt_every > 0 && o.adapt_swaps > 0 ? "exchange available RAM experts with the GPU cache; uncovered experts use the file tier"
                                                                 : "off");
         } else if (o.resident_soft) {
             std::fprintf(stderr, "strata generate: WARNING: the resident RAM mode does not fit (%s); the experts the "
@@ -7794,6 +7796,16 @@ int main(int argc, char** argv) {
     }
     // (the arena mode has no RAM copy to exchange with: its experts are always in RAM, the tier only copies them in)
     if (o.adapt_async && !src.complement_ready() && srcp != &arena_src) adapt_async_off("the resident RAM mode is not running");
+    const bool prompt_stream_requested = [] {
+        const char* value = std::getenv("STRATA_PROMPT_STREAM");
+        return value && std::atoi(value) != 0;
+    }();
+    if (prompt_stream_requested && srcp == &src) {
+        std::string why;
+        const bool enabled = src.open_prompt_stream(why);
+        std::fprintf(stderr, "strata generate: prompt file reader v1: %s (%s)\n",
+                     enabled ? "active" : "inactive", why.c_str());
+    }
     // pp-opt: with the file tier unbuffered, the mapped view of experts.bin is only a fallback from here on - and while
     // it exists NTFS serves the unbuffered reads one at a time (drop_mapping).  STRATA_KEEP_MAPPING=1 keeps it (A/B).
     if (srcp == &src && src.unbuffered() && std::getenv("STRATA_KEEP_MAPPING") == nullptr) {
@@ -9102,7 +9114,27 @@ int main(int argc, char** argv) {
                     if (!as_tail && L == tail_ckpt_len) tail_ckpt_len = -1;   // a periodic one lands here: a normal item now
                     return true;
                 }
-            ConvCheckpoint c = parts == nullptr ? ckpt_pool.take() : ConvCheckpoint{};   // (STRATA_CKPT_POOL)
+            ConvCheckpoint c;
+            const bool recycle = [] {
+                const char* v = std::getenv("STRATA_MEMORY_LIFECYCLE");
+                return v != nullptr && std::atoi(v) != 0;
+            }();
+            bool recycled = false;
+            if (recycle && parts == nullptr && !ckpt_pool.on() && !o.prompt_cache_spread && !o.prompt_cache_tail &&
+                !as_tail && stages.empty() && check_clock != (std::numeric_limits<uint64_t>::max)() &&
+                std::none_of(checks.begin(), checks.end(), [](const auto& x) { return x.pinned; })) {
+                std::vector<uint64_t> stamps;
+                for (const auto& x : checks) stamps.push_back(x.used);
+                const size_t victim = strata::program::conv_cache::reuse_before_capture(
+                    stamps.data(), stamps.size(), o.prompt_cache, true);
+                if (victim < checks.size()) {
+                    c = std::move(checks[victim]);
+                    checks.erase(checks.begin() + (std::ptrdiff_t) victim);
+                    c.plan = {}; c.used = 0; c.pinned = false; c.stage_parts.clear();
+                    recycled = true;
+                }
+            }
+            if (!recycled && parts == nullptr) c = ckpt_pool.take();
             c.ids.assign(cur.begin(), cur.begin() + L);
             c.imgs = imgs_below(req_imgs, L);
             if (parts != nullptr) {
@@ -10561,6 +10593,15 @@ int main(int argc, char** argv) {
         constexpr int64_t kImagePad = 248056;   // qwen4exp.ple.image_token_id: the PLE hash reads it for image cells
         bool mrope_identity = true;
         std::vector<float> img_rows;
+        strata::core::VisionRecords image_map;
+        const bool use_image_mmap = [] {
+#if defined(__linux__)
+            const char* v = std::getenv("STRATA_VISION_MMAP");
+            return v != nullptr && std::atoi(v) != 0;
+#else
+            return false;
+#endif
+        }();
         std::vector<const float*> row_ptr;
         // ---- #533: VRAM <reserve_mib>, between requests, only with --vram-elastic.  It shrinks the expert cache
         // until that much VRAM is free for other programs (a game, a CAD session), or grows it back towards its full
@@ -11274,8 +11315,41 @@ int main(int argc, char** argv) {
                 if (!pump(false)) return false;
             return true;
         };
+        const bool idle_shadow_requested = [] {
+            const char* v = std::getenv("STRATA_MEMORY_LIFECYCLE");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        // Concurrent slots, split stages, Foresight and asynchronous adaptation
+        // need a different ownership fence. Keep their existing paths untouched.
+        const bool idle_shadow_on = idle_shadow_requested && o.batch == 0 && !piped && !pipe && !ajob &&
+                                    stages.empty() && !peer.valid() && srcp == &src && src.complement_ready();
+        bool idle_shadow_noted = false;
+        bool idle_shadow_gpu_trusted = false;
+        if (idle_shadow_on)
+            std::fprintf(stderr, "strata serve: idle GPU shadows: live ownership v2\n");
+        if (idle_shadow_requested && !idle_shadow_on)
+            std::fprintf(stderr, "strata serve: idle GPU shadows not active: requires the single-GPU resident serve path\n");
         for (;;) {
             line_drain_ms = 0.0;
+            if (idle_shadow_on && std::all_of(pf_parts.begin(), pf_parts.end(), [](const auto& p) { return p.lent.empty(); })) {
+                // Every queued default adaptive exchange must land before taking
+                // the idle lease. No CPU worker or GPU graph runs while next_line
+                // waits; the next command restores the lease before touching state.
+                apply_pending(true);
+                size_t freed = 0;
+                std::string shadow_error;
+                if (!src.release_idle_gpu_shadows(xcache, host_res, freed, shadow_error, !idle_shadow_gpu_trusted)) {
+                    std::printf("ERR %s\n", shadow_error.c_str());
+                    std::fflush(stdout);
+                    return 1;
+                } else if (!freed && !shadow_error.empty() && !idle_shadow_noted) {
+                    std::fprintf(stderr, "strata serve: %s\n", shadow_error.c_str());
+                } else if (freed || !idle_shadow_noted) {
+                    std::fprintf(stderr, "strata serve: idle GPU shadows: released %.1f MiB of duplicate host pages; "
+                                         "CPU-only expert weights retained in RAM\n", (double) freed / (1 << 20));
+                }
+                idle_shadow_noted = true;
+            }
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
                     if (!(piped ? pump(true) : batch_step())) return 1;
@@ -11302,6 +11376,24 @@ int main(int argc, char** argv) {
             } else if (!next_line(line)) {
                 break;
             }
+            if (idle_shadow_on && line != "QUIT" && src.idle_gpu_shadow_bytes()) {
+                const auto restore_at = Clock::now();
+                const size_t bytes = src.idle_gpu_shadow_bytes();
+                std::string shadow_error;
+                if (!src.restore_idle_gpu_shadows(xcache, host_res, shadow_error)) {
+                    std::printf("ERR %s\n", shadow_error.c_str());
+                    std::fflush(stdout);
+                    return 1;   // no command may observe partially restored bytes
+                }
+                std::fprintf(stderr, "strata serve: idle GPU shadows: restored %.1f MiB from VRAM in %.1f ms\n",
+                             (double) bytes / (1 << 20),
+                             std::chrono::duration<double, std::milli>(Clock::now() - restore_at).count());
+            }
+            // Generation refills every prompt loan before decoding. Other commands
+            // can rebuild prefill scratch, so the next lease refreshes their VRAM
+            // shadows from the valid RAM bytes rather than trusting slot metadata.
+            if (idle_shadow_on)
+                idle_shadow_gpu_trusted = line.rfind("GEN ", 0) == 0 || line.rfind("GENI ", 0) == 0;
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
             // request's prompt and first token as a GEN 1, then continues it in that slot
             if (line.rfind("BSTOP ", 0) == 0) {
@@ -11622,6 +11714,11 @@ int main(int argc, char** argv) {
                 std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
                 continue;
             }
+            // Exclude startup, idle and control-command I/O from request totals.
+            const auto request_io0 = strata::platform::proc_io_sample();
+            const auto request_expert_io0 = src.io_counters();
+            const uint64_t request_file_bytes0 = src.file_read_bytes();
+            const auto request_prompt_io0 = src.prompt_stream_stats();
             char* endp = nullptr;
             const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
             // optional sampling keys between max_new and the ids: temperature=F, top_p=F, top_k=N, min_p=F,
@@ -11720,6 +11817,14 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+            // Before allocating row tables or reading image payloads. The old check
+            // happened only after all image rows had already been copied into RAM.
+            if (n > o.max_context - 8 || max_new > o.max_context - n - 8) {
+                std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n",
+                            (long long) n, (long long) max_new, (long long) o.max_context);
+                continue;
+            }
+            image_map.close();
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
             if (geni || !mrope_identity) {
@@ -11738,18 +11843,30 @@ int main(int argc, char** argv) {
                     struct Img { int64_t n, nx, ny; size_t off; };
                     std::vector<Img> imgs;
                     img_rows.clear();
-                    std::FILE* f = std::fopen(emb_path.c_str(), "rb");
-                    if (!f) ve = "cannot open " + emb_path;
+                    const uint64_t max_image_rows = (uint64_t) std::count(ids.begin(), ids.end(), kImagePad);
+                    uint64_t image_rows = 0;
+                    if (use_image_mmap && image_map.open(emb_path, g.n_embd, max_image_rows, ve)) {
+                        for (const auto& im : image_map.images())
+                            imgs.push_back({im.n, im.nx, im.ny, imgs.size()});
+                    }
+                    std::FILE* f = use_image_mmap ? nullptr : std::fopen(emb_path.c_str(), "rb");
+                    if (!use_image_mmap && !f) ve = "cannot open " + emb_path;
                     while (f && ve.empty()) {
                         int32_t hdr[5];
                         const size_t got = std::fread(hdr, sizeof(int32_t), 5, f);
-                        if (got == 0) break;
+                        if (got == 0) { if (std::ferror(f)) ve = "cannot read embeddings file"; break; }
                         if (got != 5 || hdr[0] != 0x31455653 || hdr[1] < 1 || hdr[2] < 1 || hdr[3] < 1 ||
                             (int64_t) hdr[2] * hdr[3] != hdr[1] || hdr[4] != (int32_t) g.n_embd) {
                             ve = "bad embeddings file (expected strata-vision records of width " +
                                  std::to_string((long long) g.n_embd) + ")";
                             break;
                         }
+                        if ((uint64_t) hdr[1] > max_image_rows - image_rows ||
+                            (uint64_t) hdr[1] > (img_rows.max_size() - img_rows.size()) / (uint64_t) hdr[4]) {
+                            ve = "embeddings rows exceed the prompt's image tokens";
+                            break;
+                        }
+                        image_rows += (uint64_t) hdr[1];
                         const size_t off = img_rows.size(), cnt = (size_t) hdr[1] * (size_t) hdr[4];
                         img_rows.resize(off + cnt);
                         if (std::fread(img_rows.data() + off, sizeof(float), cnt, f) != cnt) { ve = "short embeddings file"; break; }
@@ -11762,13 +11879,14 @@ int main(int argc, char** argv) {
                         if (ids[(size_t) i] != kImagePad) { put(i, p, p, p); ++p; ++i; continue; }
                         if (k >= imgs.size()) { ve = "the prompt has more images than the embeddings file"; break; }
                         const Img& im = imgs[k++];
+                        const float* image_data = use_image_mmap ? image_map.images()[im.off].data : img_rows.data() + im.off;
                         {   // what the conversation cache compares: a picture is its grid and its embeddings
                             const int64_t grid[3] = {im.n, im.nx, im.ny};
                             uint64_t h = fnv1a(grid, sizeof grid);
                             if (req_img_keys.size() == imgs.size())   // #2228: the server's key for picture k
                                 h = fnv1a(&req_img_keys[k - 1], sizeof(uint64_t), h);
                             else
-                                h = fnv1a(img_rows.data() + im.off, (size_t) im.n * (size_t) g.n_embd * sizeof(float), h);
+                                h = fnv1a(image_data, (size_t) im.n * (size_t) g.n_embd * sizeof(float), h);
                             req_imgs.push_back({i, h});
                         }
                         for (int64_t j = 0; j < im.n && ve.empty(); ++j)
@@ -11778,7 +11896,7 @@ int main(int argc, char** argv) {
                         for (int64_t j = 0; j < im.n && ve.empty(); ++j) {
                             const int64_t y = j / im.nx, x = j % im.nx;
                             put(i + j, p, p + y, p + x);
-                            row_ptr[(size_t) (i + j)] = img_rows.data() + im.off + (size_t) j * (size_t) g.n_embd;
+                            row_ptr[(size_t) (i + j)] = image_data + (size_t) j * (size_t) g.n_embd;
                         }
                         i += im.n;
                         p += std::max(im.nx, im.ny);
@@ -11787,7 +11905,7 @@ int main(int argc, char** argv) {
                     if (ve.empty() && n > 0 && ids[(size_t) (n - 1)] == kImagePad) ve = "the prompt cannot end in an image";
                     for (int64_t c = n; ve.empty() && c < cells; ++c) put(c, p + (c - n), p + (c - n), p + (c - n));
                 }
-                tr("positions built", (long long) img_rows.size());
+                tr("positions built", (long long) (use_image_mmap ? image_map.floats() : img_rows.size()));
                 cudaDeviceSynchronize();
                 tr("device idle");
                 // CUDA0's table and, with a layer split, every later stage's (each device reads its own)
@@ -13530,6 +13648,24 @@ int main(int argc, char** argv) {
             double dt_adapt_wait = 0, dt_adapt_join = 0;   // the tier's wait before a window / join after the draft (ms, summed)
             const int64_t dt_sw0 = ajob ? a_swapped : adapt_nswaps;
             int64_t dec_windows = 0, dec_T = 0;
+            // Opt-in host-tier policy. It uses the same fixed RAM allocation and
+            // existing exact replacement operation, at quiescent decode boundaries.
+            static const bool ram_ws_requested = [] {
+                const char* v = std::getenv("STRATA_RAM_WORKING_SET");
+                return v && std::atoi(v) != 0 && std::getenv("STRATA_RAM_ADAPT") == nullptr;
+            }();
+            const bool ram_ws_on = ram_ws_requested && idle_shadow_on && !aov && !ajob &&
+                                   !src.exchange_rotation() && !drive.d.fs && !remote_opt;
+            std::vector<uint8_t> ram_ws_resident;
+            std::vector<uint64_t> ram_ws_layer_bytes;
+            int64_t ram_ws_file_mark = src.file_reads(), ram_ws_moves = 0, ram_ws_failed = 0;
+            uint64_t ram_ws_bytes = 0;
+            double ram_ws_ms = 0;
+            if (ram_ws_on) {
+                ram_ws_resident.resize(host_res.size());
+                for (int64_t l = 0; l < g.n_layers; ++l)
+                    ram_ws_layer_bytes.push_back((uint64_t) strata::kernels::cpu::expert_layout().blob_bytes(l));
+            }
             const int64_t decode_hits0 = drive.d.cache_hits;
             // CS-T: the RAM and file tiers of this request (the mmap source; 0 with the arena)
             const int64_t ram0 = src.ram_reads(), files0 = src.file_reads();
@@ -14276,7 +14412,23 @@ int main(int argc, char** argv) {
                     const char* e = std::getenv("STRATA_RAM_ADAPT");
                     return e != nullptr ? std::max(0, std::atoi(e)) : 0;
                 }();
-                if (ram_adapt_n > 0 && !first_window && !drive.d.usage.empty() && pending.empty() &&
+                if (ram_ws_on && !first_window && dec_windows % 4 == 0 && !drive.d.usage.empty() &&
+                    pending.empty() && src.file_reads() > ram_ws_file_mark) {
+                    const auto ram_ws_at = Clock::now();
+                    ram_ws_file_mark = src.file_reads();
+                    for (int64_t l = 0; l < g.n_layers; ++l)
+                        for (int64_t e = 0; e < g.n_expert; ++e)
+                            ram_ws_resident[(size_t) (l * g.n_expert + e)] = src.has_resident(l, e);
+                    const auto replacements = strata::program::ram_working_set_plan(
+                        drive.d.usage.data(), host_res.data(), ram_ws_resident.data(), ram_ws_layer_bytes.data(),
+                        (size_t) g.n_layers, (size_t) g.n_expert);
+                    for (const auto& r : replacements) {
+                        if (src.replace_resident(r.layer, r.in, r.out)) { ++ram_ws_moves; ram_ws_bytes += r.bytes; }
+                        else ++ram_ws_failed;   // a failed file read leaves the original RAM expert intact
+                    }
+                    ram_ws_ms += std::chrono::duration<double, std::milli>(Clock::now() - ram_ws_at).count();
+                }
+                if (!ram_ws_on && ram_adapt_n > 0 && !first_window && !drive.d.usage.empty() && pending.empty() &&
                     (!ajob || astate == AState::Idle) && src.complement_ready() && !multi_gpu && !peer.valid() &&
                     !remote_opt && o.batch == 0) {
                     constexpr float kRamAdaptRouted = 2.0f, kRamAdaptUnused = 0.5f;
@@ -14440,6 +14592,11 @@ int main(int argc, char** argv) {
                 p += a + 1;
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
+            if (ram_ws_requested)
+                std::fprintf(stderr, "strata serve: RAM working set v1: %s; %lld promoted, %lld failed, "
+                                     "%.1f MiB promotion reads, %.1f ms; RAM capacity unchanged\n",
+                             ram_ws_on ? "active" : "inactive for this execution mode", (long long) ram_ws_moves,
+                             (long long) ram_ws_failed, (double) ram_ws_bytes / (1 << 20), ram_ws_ms);
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
             if (!ver.wait_commit(err)) {
                 std::printf("ERR %s\n", err.c_str());
@@ -14766,6 +14923,17 @@ int main(int argc, char** argv) {
             if (src.ram_adapts() > 0)   // STRATA_RAM_ADAPT, cumulative
                 std::fprintf(stderr, "strata serve: resident RAM: %lld experts moved in from the file in place of "
                                      "unused ones (STRATA_RAM_ADAPT)\n", (long long) src.ram_adapts());
+            if ([] { const char* v = std::getenv("STRATA_RESIDENT_SWAP_PREFETCH"); return v && std::atoi(v); }()) {
+                const auto st = src.resident_readahead_stats();
+                std::fprintf(stderr, "strata serve: resident swap prefetch v1: %llu probes, %.1f MiB read-ahead hints, "
+                                     "%llu errors, %llu budget skips, %llu pressure skips, %llu unknown-memory skips, %llu zero-swap skips; "
+                                     "%.1f ms in the lookahead worker (cumulative; hints do not lock RAM)\n",
+                             (unsigned long long) st.probes, (double) st.advised_bytes / (1 << 20),
+                             (unsigned long long) st.errors, (unsigned long long) st.budget_skips,
+                             (unsigned long long) st.pressure_skips, (unsigned long long) st.unknown_skips,
+                             (unsigned long long) st.no_swap_skips,
+                             (double) st.microseconds / 1000.0);
+            }
             if (ajob)   // --adapt-async, cumulative (a round may still be in flight: it lands before the next request)
                 std::fprintf(stderr, "strata serve: asynchronous adaptive tier: %lld rounds, %lld experts swapped in, "
                                      "%.1f ms per round (start to flip, between windows)",
@@ -14787,15 +14955,14 @@ int main(int argc, char** argv) {
                                      "%.1f MB read%s\n", (long long) req_hits, (long long) src.ram_reads(),
                              (long long) src.file_reads(), (double) src.file_read_bytes() / 1e6,
                              src.gguf_mode() ? " (the GGUF in place)" : "");
-                // what the OS did for this request (since the previous one): the drive's share of the file tier's reads
-                // against the page cache's, and what the I/O path did about it
-                static strata::platform::ProcIo io_prev;
-                static strata::core::FileExpertSource::IoCounters ic_prev;
-                static uint64_t fb_prev = 0;
+                // Request-local baselines exclude startup and idle/control I/O.
+                const auto& io_prev = request_io0;
+                const auto& ic_prev = request_expert_io0;
+                const uint64_t fb_prev = request_file_bytes0;
                 const strata::platform::ProcIo io_now = strata::platform::proc_io_sample();
                 const strata::core::FileExpertSource::IoCounters ic = src.io_counters();
                 const uint64_t fb = src.file_read_bytes();
-                if (io_now.valid) {
+                if (io_now.valid && io_prev.valid) {
                     std::fprintf(stderr, "strata serve: file tier I/O this request: the OS read %.1f MB from storage (%llu major faults) for "
                                          "%.1f MB of expert reads", (double) (io_now.read_bytes - io_prev.read_bytes) / 1e6,
                                  (unsigned long long) (io_now.major_faults - io_prev.major_faults), (double) (fb - fb_prev) / 1e6);
@@ -14815,10 +14982,18 @@ int main(int argc, char** argv) {
                                      (double) (ic.crit_us - ic_prev.crit_us) / 1e3,
                                      (unsigned long long) (ic.crit_n - ic_prev.crit_n));
                     std::fprintf(stderr, "\n");
-                    io_prev = io_now;
-                    ic_prev = ic;
-                    fb_prev = fb;
                 }
+            }
+            if (prompt_stream_requested) {
+                const auto now = src.prompt_stream_stats();
+                std::fprintf(stderr, "strata serve: prompt file reader v1: %.1f MiB cached, %.1f MiB RWF_DONTCACHE, "
+                                     "%.1f MiB O_DIRECT, %.1f MiB buffered fallback; %llu unsupported, %llu errors (this request)\n",
+                             (double) (now.cached - request_prompt_io0.cached) / 1048576.0,
+                             (double) (now.dontcache - request_prompt_io0.dontcache) / 1048576.0,
+                             (double) (now.direct - request_prompt_io0.direct) / 1048576.0,
+                             (double) (now.buffered - request_prompt_io0.buffered) / 1048576.0,
+                             (unsigned long long) (now.unsupported - request_prompt_io0.unsupported),
+                             (unsigned long long) (now.errors - request_prompt_io0.errors));
             }
             // STRATA_SPLIT_TIMING: where each verify stage's host time went, cumulative per window since the start
             // (waiting for its GPU to ring a layer, the CPU pool and plan per layer, staging the window)

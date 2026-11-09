@@ -3936,13 +3936,13 @@ class ReasoningCloseRetry(unittest.TestCase):
         self.assertEqual(len(self.engine.prompts), 1)
         self.assertEqual(c["message"]["content"], "Fine.")
 
-    def test_a_reply_that_closed_its_thinking_right_after_a_quote_is_not_touched(self):
+    def test_a_reply_that_closed_its_thinking_right_after_a_quote_still_gets_an_answer(self):
         # #537: that </think> waits for the character after it; the end of the turn makes it the end of the thinking
         self.svc.reasoning_close_retry = True
         self.engine.THOUGHT = 'two plus two is "4"</think>'
         c = self.chat()
-        self.assertEqual(len(self.engine.prompts), 1)
-        self.assertFalse(c["message"].get("content"))
+        self.assertEqual(len(self.engine.prompts), 2)
+        self.assertEqual(c["message"]["content"], EndsInsideThinkingEngine.ANSWER)
         self.assertEqual(c["message"]["reasoning_content"], 'two plus two is "4"')
 
 
@@ -5541,6 +5541,13 @@ class VisionArgs(unittest.TestCase):
         self.assertNotIn("--min-tokens", base)
         self.assertEqual(self.args_for({"max_tokens": 1024, "min_tokens": 768})[-4:],
                          ["--max-tokens", "1024", "--min-tokens", "768"])
+
+    def test_cpu_workspace_release_is_opt_in(self):
+        self.assertNotIn("--release-workspace", self.args_for({"max_tokens": 300}))
+        args = self.args_for({"max_tokens": 300, "threads": 8, "release_workspace": True})
+        self.assertIn("--release-workspace", args)
+        self.assertEqual(args[args.index("--max-tokens") + 1], "300")
+        self.assertEqual(args[args.index("--threads") + 1], "8")
 
 
 class VisionCacheEviction(unittest.TestCase):

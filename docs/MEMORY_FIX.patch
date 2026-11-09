@@ -1,0 +1,2542 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -111,6 +111,18 @@
+ option(STRATA_BUILD_TESTS "Build the test suite" ${_strata_tests_default})
+ option(STRATA_BUILD_CONVERSATION_TESTS "Build standalone conversation cache tests" OFF)
+ option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
++if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND (STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS))
++  enable_testing()
++  add_executable(vision_records_test tests/core/vision_records_test.cpp)
++  target_include_directories(vision_records_test PRIVATE include)
++  add_test(NAME vision_records_test COMMAND vision_records_test ${CMAKE_CURRENT_BINARY_DIR})
++  add_executable(idle_gpu_shadows_test tests/core/idle_gpu_shadows_test.cpp)
++  target_include_directories(idle_gpu_shadows_test PRIVATE include)
++  add_test(NAME idle_gpu_shadows_test COMMAND idle_gpu_shadows_test)
++  add_executable(idle_gpu_ownership_test tests/core/idle_gpu_ownership_test.cpp)
++  target_include_directories(idle_gpu_ownership_test PRIVATE include)
++  add_test(NAME idle_gpu_ownership_test COMMAND idle_gpu_ownership_test)
++endif()
+ # #2027: defined here, before the GPU section reads it to register the native-expert tests (it was defined at the
+ # native-experts section far below, so a first configure registered four tests fewer than the second)
+ option(STRATA_NATIVE_EXPERTS "Native (IQ) expert support through ggml-cpu" ON)
+--- a/include/strata/core/expert_source.hpp
++++ b/include/strata/core/expert_source.hpp
+@@ -24,6 +24,7 @@
+ #include "strata/core/expert_cache.hpp"
+ #include "strata/core/pinned.hpp"
+ #include "strata/core/exchange_storage.hpp"
++#include "strata/core/idle_gpu_shadows.hpp"
+ #include "strata/core/hit_hook.hpp"
+ #include "strata/kernels/cpu/pool.hpp"
+ 
+@@ -701,6 +702,16 @@
+     bool complement_pinned() const { return complement_pinned_; }
+     bool complement_ready() const { return complement_ready_; }
+     uint64_t locked_bytes() const { return complement_locked_; }
++    /// --serve, single GPU only, between requests after all copies/adaptation have
++    /// drained. Release only pageable host duplicates of experts still in cache.
++    /// Restore before any command can lend, evict or read those experts. Both
++    /// calls require the serve loop's live residency, not the startup profile.
++    bool release_idle_gpu_shadows(ExpertCache& cache, const std::vector<int32_t>& live_residency,
++                                  size_t& bytes, std::string& err,
++                                  bool refresh_gpu = false);
++    bool restore_idle_gpu_shadows(const ExpertCache& cache, const std::vector<int32_t>& live_residency,
++                                  std::string& err);
++    size_t idle_gpu_shadow_bytes() const { return idle_shadows_.released_bytes(); }
+     /// Lend-region slots whose experts the compact copy holds (the last ones of the cache).
+     int64_t resident_lent_slots() const { return complement_lent_slots_; }
+ 
+@@ -993,6 +1004,7 @@
+     uint64_t mapped_bytes_ = 0;
+     std::vector<uint64_t> layer_offsets_, layer_blob_bytes_;
+     void* complement_arena_ = nullptr;
++    detail::IdleGpuShadows idle_shadows_;
+     const uint8_t* complement_host_ = nullptr;
+     const uint8_t* complement_device_ = nullptr;
+     uint64_t complement_bytes_ = 0;
+--- a/include/strata/core/expert_cache.hpp
++++ b/include/strata/core/expert_cache.hpp
+@@ -201,6 +201,10 @@
+     /// against a `cudaStreamNonBlocking` one.  The first version used the async form and `verify_slot` refused
+     /// the whole run with "slot 0 differs from the arena at byte 0" - which is the check doing its job.
+     bool fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes = 0);
++    /// Idle-only inverse of fill_slot_blocking. HIP reuses the same bounded pinned
++    /// bounce buffer, avoiding driver registrations over a large pageable arena.
++    /// Do not run concurrently with another blocking transfer on this cache.
++    bool copy_slot_to_host_blocking(int32_t slot, uint8_t* host_blob, std::string& err, int64_t bytes) const;
+     /// perf-review D-4: `fill_slot_blocking`'s copy on the same (legacy) stream, but queued: many slots are refilled
+     /// with one `sync_queued` at the end instead of a wait per slot. Same ordering against earlier work, same bytes.
+     bool fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes = 0);
+--- a/include/strata/program/conv_cache.hpp
++++ b/include/strata/program/conv_cache.hpp
+@@ -38,6 +38,15 @@
+     for (size_t i = 2; i < n; ++i)
+         if (stamps[i] < stamps[v]) v = i;
+     return v;
++}
++
++// With an unpinned ordinary LRU cache already at capacity, an incoming checkpoint
++// has the newest stamp and cannot be its own victim. Recycle the same old victim
++// before capture so its large state vectors are overwritten instead of allocating
++// a seventh checkpoint and freeing one only afterwards. n means "not applicable".
++inline size_t reuse_before_capture(const uint64_t* stamps, size_t n, int64_t cap, bool ordinary) {
++    if (!ordinary || cap <= 0 || n != (size_t) cap || !n) return n;
++    return eviction_victim(stamps, n, cap);
+ }
+ 
+ /// --prompt-cache-tail: the extra checkpoint near the prompt's end (`tail[i]`) is the first to go - it serves
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -1000,6 +1000,7 @@
+ void FileExpertSource::close() {
+     io_stop();
+     inputs_.clear();
++    idle_shadows_.clear();
+     if (complement_arena_ != nullptr) {
+         if (complement_pinned_ && !complement_registered_) (void) cudaFreeHost(complement_arena_);
+         else {
+@@ -3295,7 +3296,84 @@
+     return true;
+ }
+ 
++bool FileExpertSource::release_idle_gpu_shadows(ExpertCache& cache, const std::vector<int32_t>& live_residency,
++                                               size_t& bytes, std::string& err,
++                                               bool refresh_gpu) {
++    bytes = 0;
++    err.clear();
++#if defined(__linux__)
++    if (idle_shadows_.active()) { bytes = idle_shadows_.released_bytes(); return true; }
++    if (!complement_ready_ || complement_arena_ == nullptr || !cache.valid()) return true;
++    if (complement_pinned_ || complement_registered_ || complement_locked_ || exchange_storage_.active() ||
++        !staged_.empty() || fs_swap_.load(std::memory_order_acquire) != nullptr) {
++        err = "idle GPU shadows: pinned/rotated/in-flight experts cannot be reclaimed";
++        return true;  // unsupported combination: leave every page resident
++    }
++    std::vector<detail::GpuShadowBlob> blobs;
++    if (!detail::gpu_shadow_plan(complement_offsets_, layer_blob_bytes_, (size_t) n_expert_,
++                                 live_residency, (size_t) cache.slots(), blobs, err)) return false;
++    for (const auto& b : blobs) {
++        if (cache.device_slot(b.slot) == nullptr || b.offset > complement_bytes_ ||
++            b.bytes > complement_bytes_ - b.offset ||
++            b.bytes > (size_t) (cache.bytes_of((int64_t) b.slot + 1) - cache.bytes_of(b.slot))) {
++            err = "idle GPU shadows: invalid cache slot or host bounds before reclaim";
++            return false;
++        }
++    }
++    if (blobs.empty()) return true;
++    if (cudaDeviceSynchronize() != cudaSuccess) {
++        err = "idle GPU shadows: GPU did not finish before reclaim";
++        (void) cudaGetLastError();
++        return false;
++    }
++    // At startup or after relayout, prefill may have initialized scratch in the
++    // tail slots without changing their ownership table. Make those exact RAM
++    // bytes authoritative on the GPU before discarding any host page.
++    if (refresh_gpu) {
++        for (const auto& b : blobs) {
++            if (!cache.fill_slot_blocking(b.slot, (const uint8_t*) complement_host_ + b.offset, err, (int64_t) b.bytes)) {
++                err = "idle GPU shadows: could not refresh VRAM before reclaim: " + err;
++                (void) cudaGetLastError();
++                return false;
++            }
++        }
++    }
++    if (!idle_shadows_.release(complement_arena_, (size_t) complement_bytes_, std::move(blobs), err)) return false;
++    bytes = idle_shadows_.released_bytes();
++#else
++    (void) cache; (void) live_residency; (void) refresh_gpu;
++#endif
++    return true;
++}
++
++bool FileExpertSource::restore_idle_gpu_shadows(const ExpertCache& cache,
++                                               const std::vector<int32_t>& live_residency, std::string& err) {
++    err.clear();
++    if (idle_shadows_.active() && live_residency.size() != complement_offsets_.size()) {
++        err = "idle GPU shadows: live ownership table changed shape before restore";
++        return false;
++    }
++    return idle_shadows_.restore(complement_arena_, [&](const detail::GpuShadowBlob& b, uint8_t* dst, std::string& why) {
++        const uint8_t* gpu = cache.device_slot(b.slot);
++        if (b.expert >= complement_offsets_.size() || complement_offsets_[b.expert] != b.offset ||
++            !detail::gpu_shadow_owner_matches(b, live_residency) || gpu == nullptr ||
++            cache.bytes_of((int64_t) b.slot + 1) - cache.bytes_of(b.slot) < (int64_t) b.bytes) {
++            why = "idle GPU shadows: cache ownership changed before restore";
++            return false;
++        }
++        if (!cache.copy_slot_to_host_blocking(b.slot, dst, why, (int64_t) b.bytes)) {
++            why = "idle GPU shadows: restore from VRAM failed: " + why;
++            (void) cudaGetLastError();
++            return false;
++        }
++        return true;
++    }, err);
++}
++
+ const uint8_t* FileExpertSource::resident_blob(size_t index) const {
++    // Defensive fallback for a source query made while the engine is idle: never
++    // expose discarded (zero) bytes as weights. Normal inference restores first.
++    if (idle_shadows_.active() && idle_shadows_.missing(index)) return nullptr;
+     if (exchange_storage_.active()) return exchange_storage_.resident(index).host;
+     return detail::cache_complement_blob_or_fallback(index, complement_offsets_, complement_host_, nullptr);
+ }
+--- a/src/core/expert_cache.cpp
++++ b/src/core/expert_cache.cpp
+@@ -725,6 +725,29 @@
+     return true;
+ }
+ 
++bool ExpertCache::copy_slot_to_host_blocking(int32_t slot, uint8_t* host_blob, std::string& err, int64_t bytes) const {
++    const auto* src = device_slot(slot);
++    if (!src || !host_blob || bytes <= 0 || bytes > blob_ || slot >= live_slots_ ||
++        bytes > bytes_of((int64_t) slot + 1) - bytes_of(slot)) {
++        err = "ExpertCache::copy_slot_to_host_blocking: invalid slot or blob bounds";
++        return false;
++    }
++    const size_t n = (size_t) bytes;
++#if defined(STRATA_USE_HIP)
++    if (!blocking_staging_ || n > blocking_staging_bytes_) {
++        err = "ExpertCache::copy_slot_to_host_blocking: HIP staging buffer is too small";
++        return false;
++    }
++    const cudaError_t e = cudaMemcpy(blocking_staging_, src, n, cudaMemcpyDeviceToHost);
++    if (e == cudaSuccess) std::memcpy(host_blob, blocking_staging_, n);
++#else
++    const cudaError_t e = cudaMemcpy(host_blob, src, n, cudaMemcpyDeviceToHost);
++#endif
++    if (e == cudaSuccess) return true;
++    err = std::string("ExpertCache::copy_slot_to_host_blocking: ") + cudaGetErrorString(e);
++    return false;
++}
++
+ bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
+     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+     uint8_t* dst = device_slot(slot);
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -25,6 +25,7 @@
+ #include "strata/core/conversation_snapshot.hpp"
+ #include "strata/core/conversation_file.hpp"
+ #include "strata/core/session_save_reclaim.hpp"
++#include "strata/core/vision_records.hpp"
+ #include "strata/core/conversation_memory.hpp"
+ #include "strata/core/coupled_draft.hpp"
+ #include "strata/core/expert_source.hpp"
+@@ -9102,7 +9103,27 @@
+                     if (!as_tail && L == tail_ckpt_len) tail_ckpt_len = -1;   // a periodic one lands here: a normal item now
+                     return true;
+                 }
+-            ConvCheckpoint c = parts == nullptr ? ckpt_pool.take() : ConvCheckpoint{};   // (STRATA_CKPT_POOL)
++            ConvCheckpoint c;
++            const bool recycle = [] {
++                const char* v = std::getenv("STRATA_MEMORY_LIFECYCLE");
++                return v != nullptr && std::atoi(v) != 0;
++            }();
++            bool recycled = false;
++            if (recycle && parts == nullptr && !ckpt_pool.on() && !o.prompt_cache_spread && !o.prompt_cache_tail &&
++                !as_tail && stages.empty() && check_clock != (std::numeric_limits<uint64_t>::max)() &&
++                std::none_of(checks.begin(), checks.end(), [](const auto& x) { return x.pinned; })) {
++                std::vector<uint64_t> stamps;
++                for (const auto& x : checks) stamps.push_back(x.used);
++                const size_t victim = strata::program::conv_cache::reuse_before_capture(
++                    stamps.data(), stamps.size(), o.prompt_cache, true);
++                if (victim < checks.size()) {
++                    c = std::move(checks[victim]);
++                    checks.erase(checks.begin() + (std::ptrdiff_t) victim);
++                    c.plan = {}; c.used = 0; c.pinned = false; c.stage_parts.clear();
++                    recycled = true;
++                }
++            }
++            if (!recycled && parts == nullptr) c = ckpt_pool.take();
+             c.ids.assign(cur.begin(), cur.begin() + L);
+             c.imgs = imgs_below(req_imgs, L);
+             if (parts != nullptr) {
+@@ -10561,6 +10582,15 @@
+         constexpr int64_t kImagePad = 248056;   // qwen4exp.ple.image_token_id: the PLE hash reads it for image cells
+         bool mrope_identity = true;
+         std::vector<float> img_rows;
++        strata::core::VisionRecords image_map;
++        const bool use_image_mmap = [] {
++#if defined(__linux__)
++            const char* v = std::getenv("STRATA_VISION_MMAP");
++            return v != nullptr && std::atoi(v) != 0;
++#else
++            return false;
++#endif
++        }();
+         std::vector<const float*> row_ptr;
+         // ---- #533: VRAM <reserve_mib>, between requests, only with --vram-elastic.  It shrinks the expert cache
+         // until that much VRAM is free for other programs (a game, a CAD session), or grows it back towards its full
+@@ -11274,8 +11304,41 @@
+                 if (!pump(false)) return false;
+             return true;
+         };
++        const bool idle_shadow_requested = [] {
++            const char* v = std::getenv("STRATA_MEMORY_LIFECYCLE");
++            return v != nullptr && std::atoi(v) != 0;
++        }();
++        // Concurrent slots, split stages, Foresight and asynchronous adaptation
++        // need a different ownership fence. Keep their existing paths untouched.
++        const bool idle_shadow_on = idle_shadow_requested && o.batch == 0 && !piped && !pipe && !ajob &&
++                                    stages.empty() && !peer.valid() && srcp == &src && src.complement_ready();
++        bool idle_shadow_noted = false;
++        bool idle_shadow_gpu_trusted = false;
++        if (idle_shadow_on)
++            std::fprintf(stderr, "strata serve: idle GPU shadows: live ownership v2\n");
++        if (idle_shadow_requested && !idle_shadow_on)
++            std::fprintf(stderr, "strata serve: idle GPU shadows not active: requires the single-GPU resident serve path\n");
+         for (;;) {
+             line_drain_ms = 0.0;
++            if (idle_shadow_on && std::all_of(pf_parts.begin(), pf_parts.end(), [](const auto& p) { return p.lent.empty(); })) {
++                // Every queued default adaptive exchange must land before taking
++                // the idle lease. No CPU worker or GPU graph runs while next_line
++                // waits; the next command restores the lease before touching state.
++                apply_pending(true);
++                size_t freed = 0;
++                std::string shadow_error;
++                if (!src.release_idle_gpu_shadows(xcache, host_res, freed, shadow_error, !idle_shadow_gpu_trusted)) {
++                    std::printf("ERR %s\n", shadow_error.c_str());
++                    std::fflush(stdout);
++                    return 1;
++                } else if (!freed && !shadow_error.empty() && !idle_shadow_noted) {
++                    std::fprintf(stderr, "strata serve: %s\n", shadow_error.c_str());
++                } else if (freed || !idle_shadow_noted) {
++                    std::fprintf(stderr, "strata serve: idle GPU shadows: released %.1f MiB of duplicate host pages; "
++                                         "CPU-only expert weights retained in RAM\n", (double) freed / (1 << 20));
++                }
++                idle_shadow_noted = true;
++            }
+             if (batch_on() || (piped && pipe_inflight())) {
+                 if (!try_next_line(line)) {
+                     if (!(piped ? pump(true) : batch_step())) return 1;
+@@ -11302,6 +11365,24 @@
+             } else if (!next_line(line)) {
+                 break;
+             }
++            if (idle_shadow_on && line != "QUIT" && src.idle_gpu_shadow_bytes()) {
++                const auto restore_at = Clock::now();
++                const size_t bytes = src.idle_gpu_shadow_bytes();
++                std::string shadow_error;
++                if (!src.restore_idle_gpu_shadows(xcache, host_res, shadow_error)) {
++                    std::printf("ERR %s\n", shadow_error.c_str());
++                    std::fflush(stdout);
++                    return 1;   // no command may observe partially restored bytes
++                }
++                std::fprintf(stderr, "strata serve: idle GPU shadows: restored %.1f MiB from VRAM in %.1f ms\n",
++                             (double) bytes / (1 << 20),
++                             std::chrono::duration<double, std::milli>(Clock::now() - restore_at).count());
++            }
++            // Generation refills every prompt loan before decoding. Other commands
++            // can rebuild prefill scratch, so the next lease refreshes their VRAM
++            // shadows from the valid RAM bytes rather than trusting slot metadata.
++            if (idle_shadow_on)
++                idle_shadow_gpu_trusted = line.rfind("GEN ", 0) == 0 || line.rfind("GENI ", 0) == 0;
+             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
+             // request's prompt and first token as a GEN 1, then continues it in that slot
+             if (line.rfind("BSTOP ", 0) == 0) {
+@@ -11720,6 +11801,14 @@
+                 continue;
+             }
+             const int64_t n = (int64_t) ids.size();
++            // Before allocating row tables or reading image payloads. The old check
++            // happened only after all image rows had already been copied into RAM.
++            if (n > o.max_context - 8 || max_new > o.max_context - n - 8) {
++                std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n",
++                            (long long) n, (long long) max_new, (long long) o.max_context);
++                continue;
++            }
++            image_map.close();
+             req_imgs.clear();
+             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
+             if (geni || !mrope_identity) {
+@@ -11738,18 +11827,30 @@
+                     struct Img { int64_t n, nx, ny; size_t off; };
+                     std::vector<Img> imgs;
+                     img_rows.clear();
+-                    std::FILE* f = std::fopen(emb_path.c_str(), "rb");
+-                    if (!f) ve = "cannot open " + emb_path;
++                    const uint64_t max_image_rows = (uint64_t) std::count(ids.begin(), ids.end(), kImagePad);
++                    uint64_t image_rows = 0;
++                    if (use_image_mmap && image_map.open(emb_path, g.n_embd, max_image_rows, ve)) {
++                        for (const auto& im : image_map.images())
++                            imgs.push_back({im.n, im.nx, im.ny, imgs.size()});
++                    }
++                    std::FILE* f = use_image_mmap ? nullptr : std::fopen(emb_path.c_str(), "rb");
++                    if (!use_image_mmap && !f) ve = "cannot open " + emb_path;
+                     while (f && ve.empty()) {
+                         int32_t hdr[5];
+                         const size_t got = std::fread(hdr, sizeof(int32_t), 5, f);
+-                        if (got == 0) break;
++                        if (got == 0) { if (std::ferror(f)) ve = "cannot read embeddings file"; break; }
+                         if (got != 5 || hdr[0] != 0x31455653 || hdr[1] < 1 || hdr[2] < 1 || hdr[3] < 1 ||
+                             (int64_t) hdr[2] * hdr[3] != hdr[1] || hdr[4] != (int32_t) g.n_embd) {
+                             ve = "bad embeddings file (expected strata-vision records of width " +
+                                  std::to_string((long long) g.n_embd) + ")";
+                             break;
+                         }
++                        if ((uint64_t) hdr[1] > max_image_rows - image_rows ||
++                            (uint64_t) hdr[1] > (img_rows.max_size() - img_rows.size()) / (uint64_t) hdr[4]) {
++                            ve = "embeddings rows exceed the prompt's image tokens";
++                            break;
++                        }
++                        image_rows += (uint64_t) hdr[1];
+                         const size_t off = img_rows.size(), cnt = (size_t) hdr[1] * (size_t) hdr[4];
+                         img_rows.resize(off + cnt);
+                         if (std::fread(img_rows.data() + off, sizeof(float), cnt, f) != cnt) { ve = "short embeddings file"; break; }
+@@ -11762,13 +11863,14 @@
+                         if (ids[(size_t) i] != kImagePad) { put(i, p, p, p); ++p; ++i; continue; }
+                         if (k >= imgs.size()) { ve = "the prompt has more images than the embeddings file"; break; }
+                         const Img& im = imgs[k++];
++                        const float* image_data = use_image_mmap ? image_map.images()[im.off].data : img_rows.data() + im.off;
+                         {   // what the conversation cache compares: a picture is its grid and its embeddings
+                             const int64_t grid[3] = {im.n, im.nx, im.ny};
+                             uint64_t h = fnv1a(grid, sizeof grid);
+                             if (req_img_keys.size() == imgs.size())   // #2228: the server's key for picture k
+                                 h = fnv1a(&req_img_keys[k - 1], sizeof(uint64_t), h);
+                             else
+-                                h = fnv1a(img_rows.data() + im.off, (size_t) im.n * (size_t) g.n_embd * sizeof(float), h);
++                                h = fnv1a(image_data, (size_t) im.n * (size_t) g.n_embd * sizeof(float), h);
+                             req_imgs.push_back({i, h});
+                         }
+                         for (int64_t j = 0; j < im.n && ve.empty(); ++j)
+@@ -11778,7 +11880,7 @@
+                         for (int64_t j = 0; j < im.n && ve.empty(); ++j) {
+                             const int64_t y = j / im.nx, x = j % im.nx;
+                             put(i + j, p, p + y, p + x);
+-                            row_ptr[(size_t) (i + j)] = img_rows.data() + im.off + (size_t) j * (size_t) g.n_embd;
++                            row_ptr[(size_t) (i + j)] = image_data + (size_t) j * (size_t) g.n_embd;
+                         }
+                         i += im.n;
+                         p += std::max(im.nx, im.ny);
+@@ -11787,7 +11889,7 @@
+                     if (ve.empty() && n > 0 && ids[(size_t) (n - 1)] == kImagePad) ve = "the prompt cannot end in an image";
+                     for (int64_t c = n; ve.empty() && c < cells; ++c) put(c, p + (c - n), p + (c - n), p + (c - n));
+                 }
+-                tr("positions built", (long long) img_rows.size());
++                tr("positions built", (long long) (use_image_mmap ? image_map.floats() : img_rows.size()));
+                 cudaDeviceSynchronize();
+                 tr("device idle");
+                 // CUDA0's table and, with a layer split, every later stage's (each device reads its own)
+--- a/src/program/conv_cache_test.cpp
++++ b/src/program/conv_cache_test.cpp
+@@ -53,6 +53,26 @@
+ }
+ 
+ int main() {
++    // Pre-capture recycling must choose the exact victim of the existing
++    // append-then-evict policy, including its implicit root pin.
++    bool recycling_exact = true;
++    for (size_t cap = 1; cap <= 16; ++cap) {
++        for (uint64_t seed = 1; seed <= 200; ++seed) {
++            std::vector<uint64_t> old;
++            for (size_t i = 0; i < cap; ++i) old.push_back((seed * 137 + i * 7919) % 100000);
++            auto appended = old;
++            appended.push_back(100001);
++            const auto before = strata::program::conv_cache::reuse_before_capture(old.data(), old.size(), cap, true);
++            const auto after = eviction_victim(appended.data(), appended.size(), cap);
++            recycling_exact &= before == after;
++        }
++    }
++    check(recycling_exact, "recycle before capture matches 3,200 old-policy decisions");
++    const uint64_t stamps_for_reuse[] = {1, 2, 3};
++    check(strata::program::conv_cache::reuse_before_capture(stamps_for_reuse, 3, 3, false) == 3,
++          "special pin/tail/spread policies decline recycling");
++    check(strata::program::conv_cache::reuse_before_capture(stamps_for_reuse, 3, 6, true) == 3,
++          "cache below capacity does not discard an entry");
+     std::printf("conv_cache_test\n");
+     {   // --prompt-cache-spread: 200 turns of 1,000 tokens after a 9,525-token system prompt, 6 checkpoints
+         const int64_t end = 9525 + 200 * 1000;
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -107,7 +107,7 @@
+     return f"cannot listen on {host}:{port}: {what} [{code}]. {hint}"
+ 
+ 
+-def combined_embeddings_path(vision_dir: Path, nbytes: int) -> Path:
++def combined_embeddings_path(vision_dir: Path, nbytes: int, *, prefer_memory: bool = True) -> Path:
+     """#874: where one request's combined image-embeddings file goes.  Every request with images rewrites it (it is
+     deleted after the request), which on a disk is steady heavy writing: on Linux it goes to /dev/shm when that has
+     room (the engine reads it back at once), on Windows the file is opened short-lived (the cache is not forced out
+@@ -115,7 +115,7 @@
+     own directory, as before."""
+     name = f"req-{uuid.uuid4().hex[:12]}.sve"
+     shm = Path("/dev/shm")
+-    if os.name != "nt" and shm.is_dir() and os.access(shm, os.W_OK):
++    if prefer_memory and os.name != "nt" and shm.is_dir() and os.access(shm, os.W_OK):
+         try:
+             if shutil.disk_usage(shm).free > 2 * nbytes + (16 << 20):
+                 return shm / f"strata-vision-{os.getpid()}-{name}"
+@@ -127,10 +127,20 @@
+ def write_temporary(path: Path, parts: list) -> None:
+     """#874: write `parts` (files) one after the other into `path`; on Windows with FILE_ATTRIBUTE_TEMPORARY
+     (os.O_SHORT_LIVED), so the file normally never reaches the drive before it is deleted."""
++    # Embedding cache files are immutable. A single image can share its inode with
++    # the request: no second file payload, and cache eviction cannot remove the
++    # request's link. Cross-filesystem links fall back to a bounded streaming copy.
++    if len(parts) == 1:
++        try:
++            os.link(parts[0], path)
++            return
++        except OSError:
++            pass
+     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0) | getattr(os, "O_SHORT_LIVED", 0)
+     with os.fdopen(os.open(path, flags, 0o600), "wb") as f:
+         for part in parts:
+-            f.write(Path(part).read_bytes())
++            with Path(part).open("rb") as src:
++                shutil.copyfileobj(src, f, length=1 << 20)
+ # #458: the trailing effort turn ("effort_position": "end"); low is the template's own sentence, medium (which the
+ # template says nothing for: no xhigh sentence is medium there) says it, since the xhigh one stays at the top
+ EFFORT_TURN = "<|im_start|>system\n{}<|im_end|>\n"
+@@ -1008,6 +1018,11 @@
+         """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
+         if getattr(self, "silent_note", None):          # #481: the server ended it, not the OS or the engine itself
+             return self.silent_note
++        proc = self.proc
++        rc = proc.poll() if proc is not None else None
++        if os.name != "nt" and rc in (-signal.SIGINT, -signal.SIGTERM):
++            name = signal.Signals(-rc).name
++            return f"The engine was interrupted by {name}. This exit status does not indicate an out-of-memory kill."
+         tail = wide = ""
+         try:
+             with open(self.log_path, "rb") as f:
+@@ -1022,8 +1037,6 @@
+             if "issue #29" in line:
+                 return ("The engine stopped itself because it had stopped making progress - a hang it caught. Its log "
+                         "line: " + line.strip() + " - please report it at github.com/Niko1221/Strata/issues.")
+-        proc = self.proc                                 # None while a restart has not started the next one yet
+-        rc = proc.poll() if proc is not None else None
+         if rc is not None and rc >= 0 and self.last_err:  # its own last words on stdout: they say why
+             return (f"The engine exited (code {rc}) after it reported: {self.last_err} - please report it at "
+                     "github.com/Niko1221/Strata/issues with the log.")
+@@ -2277,12 +2290,18 @@
+     sends the same picture again (every turn, with most clients) encodes it once."""
+ 
+     @staticmethod
+-    def work_dir() -> Path:
++    def work_dir(parent: str | None = None) -> Path:
+         """#480: the directory for the encoder's files.  The engine reads the embeddings file named in a `GENI` line
+         and the encoder the output named in an `ENC <image> <out>` line, both split at spaces, so a space in the path
+         (a %TEMP% under a user name with a space) broke every image.  The system temp directory is used while its path
+         has no space, then the working directory, then the system drive's root; the plain temp directory is the last
+         resort (the encoder's own files are then named relative to it, see `_start`)."""
++        if parent is not None:
++            # An explicit SSD directory must not silently fall back to a RAM-backed /tmp.
++            parent = Path(parent).resolve()
++            if " " in str(parent):
++                raise ValueError("vision.work_dir must have no spaces (the engine's image protocol splits at spaces)")
++            return Path(tempfile.mkdtemp(prefix="strata-vision-", dir=parent))
+         for parent in (None, Path.cwd(), Path(os.environ.get("SystemDrive", "C:") + os.sep)):
+             try:
+                 d = Path(tempfile.mkdtemp(prefix="strata-vision-", dir=parent))
+@@ -2307,7 +2326,10 @@
+             args += ["--max-tokens", str(cfg["max_tokens"])]
+         if cfg.get("min_tokens"):                       # #767: mtmd's image_min_tokens (a hand-edited key)
+             args += ["--min-tokens", str(cfg["min_tokens"])]
+-        self.dir = self.work_dir()
++        if cfg.get("release_workspace") is True:
++            args.append("--release-workspace")
++        self.dir = self.work_dir(cfg["work_dir"]) if cfg.get("work_dir") else self.work_dir()
++        self.memory_efficient = cfg.get("memory_efficient") is True
+         self.spawn = (args, log, env)                   # to start it again after an unload
+         self.proc = None
+         self.stopped = True
+@@ -2532,7 +2554,17 @@
+                 proc.wait(timeout=10)
+             except (OSError, subprocess.TimeoutExpired):
+                 pass
+-        self.stopped = True
++        finally:
++            # A failed flush leaves buffered QUIT data in TextIOWrapper. Close it
++            # explicitly so its destructor cannot flush again and print BrokenPipeError.
++            for pipe in (getattr(proc, "stdin", None), getattr(proc, "stdout", None)):
++                close = getattr(pipe, "close", None)
++                if callable(close):
++                    try:
++                        close()
++                    except (OSError, ValueError):
++                        pass
++            self.stopped = True
+ 
+     def shutdown(self):
+         """#914: close() for good: the server ends, so the encoder's directory (one ~10 MB .sve per image, on a tmpfs
+@@ -4042,7 +4074,8 @@
+             # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
+             # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
+             # one more for every retry of a 503.  run() deletes it; drop_embeddings() if run() never starts.
+-            combined = combined_embeddings_path(self.vision.dir, sum(Path(p).stat().st_size for p, _ in encoded))
++            combined = combined_embeddings_path(self.vision.dir, sum(Path(p).stat().st_size for p, _ in encoded),
++                                                 prefer_memory=not getattr(self.vision, "memory_efficient", False))
+             self.embeddings.path = combined             # first, so a half-written one is found as well
+             # #2228: each picture's key is its normalized bytes' hash (the encoder's file name), so the engine's
+             # conversation cache matches a picture by what it is, not by its embedding floats: a picture encoded again
+@@ -4172,7 +4205,40 @@
+                      if s["phase"] == "thinking" and s.get("thinking_budget") else f"max {s.get('max_tokens')}")
+             print(f"[strata] {s['phase']}: {s['generated']} of {limit} tokens, {rate:.1f} tok/s, "
+                   f"{el:.0f} s", flush=True)
++        if getattr(self, "runtime_memory_log", False):
++            self._log_runtime_memory()
+         return now
++
++    def _log_runtime_memory(self):
++        """At most once per ten seconds; record paging evidence while decode is stalled."""
++        from serve.runtime_memory import sample_runtime_memory
++        now = time.monotonic()
++        if now - getattr(self, "_memory_log_at", -10.0) < 10.0:
++            return
++        self._memory_log_at = now
++        proc = getattr(self.engine, "proc", None)
++        pid = getattr(proc, "pid", None)
++        if not isinstance(pid, int) or pid <= 0:
++            return
++        sample = sample_runtime_memory(pid)
++        if sample is None:
++            return
++        previous = getattr(self, "_memory_log_previous", None)
++        self._memory_log_previous = sample
++        if previous and previous["pid"] == pid:
++            for key in ("major_faults", "read_bytes"):
++                if key in previous and key in sample:
++                    sample[key + "_delta"] = max(0, sample[key] - previous[key])
++        line = "[strata] runtime memory: " + json.dumps(sample, separators=(",", ":"))
++        print(line, flush=True)
++        # Use the running engine's actual log, not another model's old coder log.
++        path = getattr(self.engine, "log_path", None)
++        if path:
++            try:
++                with open(path, "a", encoding="utf-8") as f:
++                    f.write(line + "\n")
++            except OSError:
++                pass
+ 
+     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
+         """The request's events (see _run); with "prevent_sleep" in the config, the PC stays awake while it runs or waits."""
+@@ -6951,6 +7017,7 @@
+     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
+         svc.model_arch = cfg.get("arch") or "qwen4exp"
+     svc.answer_room = cfg.get("answer_room") is not False
++    svc.runtime_memory_log = cfg.get("runtime_memory_log") is True
+     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
+         icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
+--- a/serve/test_server.py
++++ b/serve/test_server.py
+@@ -5542,6 +5542,13 @@
+         self.assertEqual(self.args_for({"max_tokens": 1024, "min_tokens": 768})[-4:],
+                          ["--max-tokens", "1024", "--min-tokens", "768"])
+ 
++    def test_cpu_workspace_release_is_opt_in(self):
++        self.assertNotIn("--release-workspace", self.args_for({"max_tokens": 300}))
++        args = self.args_for({"max_tokens": 300, "threads": 8, "release_workspace": True})
++        self.assertIn("--release-workspace", args)
++        self.assertEqual(args[args.index("--max-tokens") + 1], "300")
++        self.assertEqual(args[args.index("--threads") + 1], "8")
++
+ 
+ class VisionCacheEviction(unittest.TestCase):
+     """#1072: the cache of encoded images keeps 64; a request's own images are never evicted for a later one."""
+--- a/tools/vision/CMakeLists.txt
++++ b/tools/vision/CMakeLists.txt
+@@ -59,3 +59,12 @@
+ target_link_libraries(strata-vision PRIVATE mtmd llama)
+ target_compile_features(strata-vision PRIVATE cxx_std_17)
+ set_target_properties(strata-vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
++option(STRATA_VISION_WORKSPACE_TESTS "Build the CPU workspace lifecycle integration test" OFF)
++if(STRATA_VISION_WORKSPACE_TESTS)
++  enable_testing()
++  add_executable(cpu_workspace_test cpu_workspace_test.cpp)
++  target_include_directories(cpu_workspace_test PRIVATE ${LLAMA_DIR}/ggml/src)
++  target_link_libraries(cpu_workspace_test PRIVATE mtmd llama)
++  target_compile_features(cpu_workspace_test PRIVATE cxx_std_17)
++  add_test(NAME cpu_workspace_test COMMAND cpu_workspace_test)
++endif()
+--- a/tools/vision/strata_vision.cpp
++++ b/tools/vision/strata_vision.cpp
+@@ -18,6 +18,9 @@
+ #include "llama.h"
+ #include "mtmd.h"
+ #include "mtmd-helper.h"
++#if defined(__linux__) && defined(__GLIBC__)
++#include <malloc.h>
++#endif
+ 
+ #include <algorithm>
+ #if !defined(_WIN32)
+@@ -56,7 +59,7 @@
+ 
+ int main(int argc, char** argv) {
+     std::string mmproj, model;
+-    bool gpu = false;
++    bool gpu = false, release_workspace = false;
+     int threads = 0, max_tokens = 0, min_tokens = 0;
+     llama_flash_attn_type fa = LLAMA_FLASH_ATTN_TYPE_AUTO;
+     bool fa_given = false;
+@@ -67,8 +70,14 @@
+             return argv[++i];
+         };
+         if (a == "--mmproj") mmproj = next();
++        else if (a == "--help" || a == "-h") {
++            std::puts("strata-vision --mmproj FILE --model FILE [--gpu] [--threads N] [--max-tokens N] "
++                      "[--min-tokens N] [--flash-attn on|off|auto] [--release-workspace]");
++            return 0;
++        }
+         else if (a == "--model") model = next();
+         else if (a == "--gpu") gpu = true;
++        else if (a == "--release-workspace") release_workspace = true;
+         else if (a == "--threads") threads = std::atoi(next().c_str());
+         else if (a == "--max-tokens") max_tokens = std::atoi(next().c_str());
+         else if (a == "--min-tokens") min_tokens = std::atoi(next().c_str());   // mtmd image_min_tokens (#767)
+@@ -79,6 +88,10 @@
+             fa_given = true;
+         }
+         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
++    }
++    if (gpu && release_workspace) {
++        std::fprintf(stderr, "--release-workspace is for the CPU vision encoder\n");
++        return 2;
+     }
+     if (mmproj.empty() || model.empty()) {
+         std::fprintf(stderr, "usage: strata-vision --mmproj <mmproj.gguf> --model <model.gguf> [--gpu] [--threads N] "
+@@ -198,6 +211,7 @@
+         mtmd_input_text txt{prompt.c_str(), prompt.size(), false, true};
+         const mtmd_bitmap* bm[1] = {bw.bitmap};
+         std::string err;
++        int encoded_n = 0, encoded_nx = 0, encoded_ny = 0;
+         const mtmd_input_chunk* ichunk = nullptr;
+         if (mtmd_tokenize(ctx, chunks, &txt, bm, 1) != 0) err = "the image could not be preprocessed";
+         for (size_t c = 0; err.empty() && c < mtmd_input_chunks_size(chunks); ++c) {
+@@ -222,15 +236,30 @@
+                                 std::fwrite(embd, sizeof(float) * (size_t) n_embd, (size_t) n, f) == (size_t) n;
+                 std::fclose(f);
+                 if (!ok) err = "short write to " + out;
+-                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+-                if (ok) std::printf("OK %d %d %d %.0f\n", n, nx, ny, ms);
++                if (ok) {
++                    encoded_n = n; encoded_nx = nx; encoded_ny = ny;
++                }
+             }
+         }
+-        if (!err.empty()) std::printf("ERR %s\n", err.c_str());
+-        std::fflush(stdout);
+         mtmd_input_chunks_free(chunks);
+         mtmd_bitmap_free(bw.bitmap);
+         if (bw.video_ctx) mtmd_helper_video_free(bw.video_ctx);
++        if (release_workspace) {
++            const size_t bytes = mtmd_release_cpu_vision_work_buffers(ctx);
++#if defined(__linux__) && defined(__GLIBC__)
++            if (bytes) malloc_trim(0);
++#endif
++            std::fprintf(stderr, "strata-vision: released %.1f MiB of CPU workspace; model weights retained\n",
++                         (double) bytes / (1 << 20));
++        }
++        // Publish only after scratch has been released. The engine may immediately
++        // restore its own host shadows and prefill when this acknowledgement arrives.
++        if (!err.empty()) std::printf("ERR %s\n", err.c_str());
++        else {
++            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++            std::printf("OK %d %d %d %.0f\n", encoded_n, encoded_nx, encoded_ny, ms);
++        }
++        std::fflush(stdout);
+     }
+     mtmd_free(ctx);
+     llama_model_free(text);
+--- a/third_party/llama.cpp/tools/mtmd/clip.cpp
++++ b/third_party/llama.cpp/tools/mtmd/clip.cpp
+@@ -162,6 +162,8 @@
+ 
+     int max_nodes = 8192;
+     ggml_backend_sched_ptr sched;
++    ggml_backend_sched_eval_callback eval_callback = nullptr;
++    void * eval_callback_data = nullptr;
+     clip_flash_attn_type flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
+     bool is_allocated = false;
+ 
+@@ -221,6 +223,8 @@
+             ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 8192, false, true)
+         );
+ 
++        eval_callback = ctx_params.cb_eval;
++        eval_callback_data = ctx_params.cb_eval_user_data;
+         if (ctx_params.cb_eval != nullptr) {
+             ggml_backend_sched_set_eval_callback(sched.get(), ctx_params.cb_eval, ctx_params.cb_eval_user_data);
+         }
+@@ -4019,6 +4023,21 @@
+     return res;
+ }
+ 
++size_t clip_release_cpu_work_buffers(clip_ctx * ctx) {
++    if (!ctx || ctx->backend != ctx->backend_cpu || !ctx->is_allocated) return 0;
++    ggml_backend_sched_synchronize(ctx->sched.get());
++    const size_t bytes = ggml_backend_sched_get_buffer_size(ctx->sched.get(), ctx->backend_cpu);
++    ggml_backend_sched_ptr empty(ggml_backend_sched_new(ctx->backend_ptrs.data(), ctx->backend_buft.data(),
++                                                      ctx->backend_ptrs.size(), 8192, false, true));
++    if (!empty) return 0;
++    ggml_backend_sched_set_eval_callback(empty.get(), ctx->eval_callback, ctx->eval_callback_data);
++    ctx->sched.swap(empty);
++    empty.reset();  // free the old scheduler's compute buffers before returning
++    ctx->is_allocated = false;
++    ctx->mem_compute.clear();
++    return bytes;
++}
++
+ void clip_free(clip_ctx * ctx) {
+     if (ctx == nullptr) {
+         return;
+--- a/third_party/llama.cpp/tools/mtmd/clip.h
++++ b/third_party/llama.cpp/tools/mtmd/clip.h
+@@ -69,6 +69,9 @@
+ struct clip_init_result clip_init(const char * fname, struct clip_context_params ctx_params);
+ 
+ void clip_free(struct clip_ctx * ctx);
++// Strata: release CPU graph scratch between image requests, retaining model weights,
++// preprocessing settings and flash-attention selection. Next encode reserves again.
++size_t clip_release_cpu_work_buffers(struct clip_ctx * ctx);
+ 
+ // TODO: should be enum, not string
+ const char * clip_patch_merge_type(const struct clip_ctx * ctx);
+--- a/third_party/llama.cpp/tools/mtmd/mtmd.cpp
++++ b/third_party/llama.cpp/tools/mtmd/mtmd.cpp
+@@ -1091,6 +1091,10 @@
+         LOG_ERR("%s: error: %s\n", __func__, e.what());
+         return nullptr;
+     }
++}
++
++size_t mtmd_release_cpu_vision_work_buffers(mtmd_context * ctx) {
++    return ctx ? clip_release_cpu_work_buffers(ctx->ctx_v) : 0;
+ }
+ 
+ void mtmd_free(mtmd_context * ctx) {
+--- a/third_party/llama.cpp/tools/mtmd/mtmd.h
++++ b/third_party/llama.cpp/tools/mtmd/mtmd.h
+@@ -442,6 +442,9 @@
+ // test function, to be used in test-mtmd-c-api.c
+ MTMD_API mtmd_input_chunks * mtmd_test_create_input_chunks(void);
+ 
++// Strata extension: discard only idle CPU vision scratch; retain encoder weights.
++MTMD_API size_t mtmd_release_cpu_vision_work_buffers(mtmd_context * ctx);
++
+ #ifdef __cplusplus
+ } // extern "C"
+ #endif
+--- a/strata-coder-uncen-iq1_m.json
++++ b/strata-coder-uncen-iq1_m.json
+@@ -41,7 +41,9 @@
+   "env": {
+     "STRATA_ROCBLAS_TUNING": "/mnt/ssd/Strata/tools/hip",
+     "STRATA_RESIDENT_PIN": "0",
+-    "STRATA_RESIDENT_HEADROOM_GIB": "8"
++    "STRATA_RESIDENT_HEADROOM_GIB": "8",
++    "STRATA_RESIDENT_FILE_DIR": "",
++    "STRATA_VISION_MMAP": "1"
+   },
+   "vision": {
+     "exe": "/mnt/ssd/Strata/engine/strata-vision",
+@@ -49,6 +51,9 @@
+     "model": "/mnt/ssd/Strata-data/models/coder-uncen-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-Coder-Uncen-IQ1_M-00001-of-00002.gguf",
+     "gpu": false,
+     "max_tokens": 300,
+-    "threads": 8
+-  }
++    "threads": 8,
++    "work_dir": "/mnt/ssd/Strata-data",
++    "memory_efficient": true
++  },
++  "runtime_memory_log": true
+ }
+--- a/strata-coder-uncen-iq1_m-filebacked.json
++++ b/strata-coder-uncen-iq1_m-filebacked.json
+@@ -42,7 +42,8 @@
+     "STRATA_ROCBLAS_TUNING": "/mnt/ssd/Strata/tools/hip",
+     "STRATA_RESIDENT_PIN": "0",
+     "STRATA_RESIDENT_HEADROOM_GIB": "8",
+-    "STRATA_RESIDENT_FILE_DIR": "/mnt/ssd/Strata-data"
++    "STRATA_RESIDENT_FILE_DIR": "",
++    "STRATA_VISION_MMAP": "1"
+   },
+   "vision": {
+     "exe": "/mnt/ssd/Strata/engine/strata-vision",
+@@ -50,6 +51,9 @@
+     "model": "/mnt/ssd/Strata-data/models/coder-uncen-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-Coder-Uncen-IQ1_M-00001-of-00002.gguf",
+     "gpu": false,
+     "max_tokens": 300,
+-    "threads": 8
+-  }
++    "threads": 8,
++    "work_dir": "/mnt/ssd/Strata-data",
++    "memory_efficient": true
++  },
++  "runtime_memory_log": true
+ }
+--- /dev/null
++++ b/include/strata/core/vision_records.hpp
+@@ -0,0 +1,86 @@
++// Read-only SVE1 records: image rows share the encoder's file pages instead of
++// allocating another anonymous copy. Keep this object alive through prefill.
++#pragma once
++#include <cstdint>
++#include <cstring>
++#include <limits>
++#include <string>
++#include <vector>
++
++#if defined(__linux__)
++#include <cerrno>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
++
++namespace strata::core {
++class VisionRecords {
++public:
++    struct Image { int32_t n, nx, ny; const float* data; };
++    VisionRecords() = default;
++    VisionRecords(const VisionRecords&) = delete;
++    VisionRecords& operator=(const VisionRecords&) = delete;
++    ~VisionRecords() { close(); }
++    const std::vector<Image>& images() const { return images_; }
++    size_t floats() const { return floats_; }
++    void close() {
++        images_.clear();
++        floats_ = 0;
++#if defined(__linux__)
++        if (data_) (void) munmap(data_, bytes_);
++#endif
++        data_ = nullptr;
++        bytes_ = 0;
++    }
++    bool open(const std::string& path, int64_t width, uint64_t max_rows, std::string& err) {
++        close();
++        err.clear();
++#if defined(__linux__)
++        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
++        if (fd < 0) { err = "cannot open " + path; return false; }
++        struct stat st{};
++        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
++            (uint64_t) st.st_size > (uint64_t) std::numeric_limits<size_t>::max()) {
++            ::close(fd);
++            err = "bad embeddings file size";
++            return false;
++        }
++        bytes_ = (size_t) st.st_size;
++        void* p = mmap(nullptr, bytes_, PROT_READ, MAP_SHARED, fd, 0);
++        ::close(fd);
++        if (p == MAP_FAILED) { bytes_ = 0; err = "cannot map embeddings file"; return false; }
++        data_ = p;
++        size_t at = 0;
++        uint64_t rows = 0;
++        auto fail = [&](const char* why) { err = why; close(); return false; };
++        while (at < bytes_) {
++            int32_t h[5];
++            if (bytes_ - at < sizeof h) return fail("short embeddings header");
++            std::memcpy(h, (const char*) data_ + at, sizeof h);
++            at += sizeof h;
++            if (h[0] != 0x31455653 || h[1] < 1 || h[2] < 1 || h[3] < 1 || h[4] < 1 || h[4] != width ||
++                (int64_t) h[2] * h[3] != h[1]) return fail("bad embeddings record geometry");
++            if ((uint64_t) h[1] > max_rows - rows) return fail("embeddings rows exceed the prompt's image tokens");
++            const uint64_t count = (uint64_t) h[1] * (uint64_t) h[4];
++            if (count > (bytes_ - at) / sizeof(float)) return fail("short embeddings file");
++            // SVE1's 20-byte header and float payload keep every row 4-byte aligned.
++            images_.push_back({h[1], h[2], h[3], (const float*) ((const char*) data_ + at)});
++            floats_ += (size_t) count;
++            rows += (uint64_t) h[1];
++            at += (size_t) count * sizeof(float);
++        }
++        return true;
++#else
++        (void) path; (void) width; (void) max_rows;
++        err = "mapped vision records require Linux";
++        return false;
++#endif
++    }
++private:
++    void* data_ = nullptr;
++    size_t bytes_ = 0, floats_ = 0;
++    std::vector<Image> images_;
++};
++}  // namespace strata::core
+--- /dev/null
++++ b/include/strata/core/idle_gpu_shadows.hpp
+@@ -0,0 +1,157 @@
++// Reclaim only RAM copies that have an authoritative, unchanged copy in VRAM.
++// The caller holds the engine idle until restore completes. CPU-only experts
++// are never included. No backing file, quantization or inference change.
++#pragma once
++#include <algorithm>
++#include <cstdint>
++#include <cstddef>
++#include <limits>
++#include <string>
++#include <vector>
++#if defined(__linux__)
++#include <cerrno>
++#include <cstring>
++#include <sys/mman.h>
++#include <unistd.h>
++#endif
++
++namespace strata::core::detail {
++struct GpuShadowBlob {
++    size_t expert = 0, offset = 0, bytes = 0;
++    int32_t slot = -1;
++};
++struct GpuShadowRange { size_t offset, bytes; };
++
++// The serve loop's live table is authoritative. ExpertCache::slot_of() is the
++// original profile and is NOT updated by adaptive swaps. Never infer ownership
++// from that startup table when releasing or restoring host weights.
++inline bool gpu_shadow_plan(const std::vector<uint64_t>& offsets,
++                            const std::vector<uint64_t>& layer_bytes, size_t experts_per_layer,
++                            const std::vector<int32_t>& live, size_t slots,
++                            std::vector<GpuShadowBlob>& blobs, std::string& error) {
++    blobs.clear();
++    error.clear();
++    if (!experts_per_layer || layer_bytes.size() > (std::numeric_limits<size_t>::max)() / experts_per_layer ||
++        offsets.size() != layer_bytes.size() * experts_per_layer || live.size() != offsets.size()) {
++        error = "idle GPU shadows: invalid live ownership table shape";
++        return false;
++    }
++    std::vector<uint8_t> owned(slots, 0);
++    for (size_t i = 0; i < live.size(); ++i) {
++        const int32_t slot = live[i];
++        if (slot < 0) continue;
++        if ((size_t) slot >= slots || owned[(size_t) slot]++) {
++            error = "idle GPU shadows: invalid or multiply owned live slot";
++            blobs.clear();
++            return false;
++        }
++        const uint64_t offset = offsets[i], bytes = layer_bytes[i / experts_per_layer];
++        if (offset == (std::numeric_limits<uint64_t>::max)()) continue;
++        if (!bytes || offset > (std::numeric_limits<size_t>::max)() ||
++            bytes > (std::numeric_limits<size_t>::max)()) {
++            error = "idle GPU shadows: invalid host expert bounds";
++            blobs.clear();
++            return false;
++        }
++        blobs.push_back({i, (size_t) offset, (size_t) bytes, slot});
++    }
++    return true;
++}
++
++inline bool gpu_shadow_owner_matches(const GpuShadowBlob& blob, const std::vector<int32_t>& live) {
++    return blob.expert < live.size() && live[blob.expert] == blob.slot;
++}
++
++inline bool gpu_shadow_ranges(uintptr_t base, size_t total, size_t page,
++                              std::vector<GpuShadowBlob>& blobs,
++                              std::vector<GpuShadowRange>& ranges, std::string& error) {
++    error.clear();
++    ranges.clear();
++    if (!base || !page || total > (std::numeric_limits<uintptr_t>::max)() - base) {
++        error = "idle GPU shadows: invalid allocation bounds"; return false;
++    }
++    std::sort(blobs.begin(), blobs.end(), [](const auto& a, const auto& b) { return a.offset < b.offset; });
++    for (size_t i = 0; i < blobs.size(); ++i) {
++        const auto& b = blobs[i];
++        if (!b.bytes || b.slot < 0 || b.offset > total || b.bytes > total - b.offset ||
++            (i && blobs[i-1].offset + blobs[i-1].bytes > b.offset)) {
++            error = "idle GPU shadows: overlapping or invalid expert ranges"; return false;
++        }
++    }
++    // Join neighbouring shadow blobs before aligning. A page shared with a CPU-only
++    // blob is excluded; a page shared only by two VRAM shadows can be reclaimed.
++    for (size_t i = 0; i < blobs.size();) {
++        const size_t start = blobs[i].offset;
++        size_t end = start + blobs[i++].bytes;
++        while (i < blobs.size() && blobs[i].offset == end) { end += blobs[i].bytes; ++i; }
++        const size_t misalignment = (base + start) % page;
++        const size_t skip = misalignment ? page - misalignment : 0;
++        if (skip >= end - start) continue;
++        const size_t aligned = start + skip;
++        const size_t tail = (base + end) % page;
++        if (tail <= end - aligned && end - tail > aligned)
++            ranges.push_back({aligned, end - tail - aligned});
++    }
++    return true;
++}
++
++class IdleGpuShadows {
++public:
++    bool active() const { return !blobs_.empty(); }
++    size_t released_bytes() const { return released_; }
++    size_t blobs() const { return blobs_.size(); }
++    bool missing(size_t expert) const {
++        return std::binary_search(missing_.begin(), missing_.end(), expert);
++    }
++    void clear() { blobs_.clear(); missing_.clear(); released_ = 0; arena_ = nullptr; }
++
++    bool release(void* arena, size_t total, std::vector<GpuShadowBlob> blobs, std::string& error) {
++        error.clear();
++        if (active()) { error = "idle GPU shadows: restore the previous lease first"; return false; }
++#if defined(__linux__)
++        const long ps = sysconf(_SC_PAGESIZE);
++        std::vector<GpuShadowRange> ranges;
++        if (ps <= 0 || !gpu_shadow_ranges((uintptr_t) arena, total, (size_t) ps, blobs, ranges, error)) return false;
++        // Every allocation and validation happens before discarding a single byte.
++        std::vector<size_t> missing;
++        for (const auto& b : blobs) missing.push_back(b.expert);
++        std::sort(missing.begin(), missing.end());
++        if (std::adjacent_find(missing.begin(), missing.end()) != missing.end()) {
++            error = "idle GPU shadows: duplicate expert identity"; return false;
++        }
++        blobs_ = std::move(blobs);
++        missing_ = std::move(missing);
++        arena_ = arena;
++        released_ = 0;
++        for (const auto& r : ranges) {
++            if (madvise((uint8_t*) arena + r.offset, r.bytes, MADV_DONTNEED) == 0) released_ += r.bytes;
++            else if (error.empty()) error = std::string("idle GPU shadows: madvise: ") + std::strerror(errno);
++        }
++        if (!released_) clear();
++        return true;
++#else
++        (void) arena; (void) total; (void) blobs;
++        error = "idle GPU shadows: supported on Linux only";
++        return false;
++#endif
++    }
++
++    // A failed restore keeps the lease marked missing. Retry is safe; inference
++    // must never proceed after failure. Copy exact complete blobs, including the
++    // few boundary bytes retained to protect adjacent CPU-only experts.
++    template<class Copy>
++    bool restore(void* arena, Copy copy, std::string& error) {
++        error.clear();
++        if (active() && arena != arena_) { error = "idle GPU shadows: allocation changed during lease"; return false; }
++        for (const auto& b : blobs_)
++            if (!copy(b, (uint8_t*) arena + b.offset, error)) return false;
++        clear();
++        return true;
++    }
++private:
++    std::vector<GpuShadowBlob> blobs_;
++    std::vector<size_t> missing_;
++    size_t released_ = 0;
++    void* arena_ = nullptr;
++};
++} // namespace strata::core::detail
+--- /dev/null
++++ b/tests/core/vision_records_test.cpp
+@@ -0,0 +1,61 @@
++#include "strata/core/vision_records.hpp"
++#include <cstdio>
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
++#include <string>
++#include <vector>
++#include <unistd.h>
++
++static int checks = 0;
++static void check(bool ok, const char* why) {
++    ++checks;
++    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", why); std::exit(1); }
++}
++int main(int argc, char** argv) {
++    namespace fs = std::filesystem;
++    check(argc == 2, "pass a work directory");
++    const fs::path file = fs::path(argv[1]) / ("vision-test-" + std::to_string(getpid()) + ".sve");
++    strata::core::VisionRecords records;
++    std::string err;
++    // NaN, negative zero and a denormal must retain their exact float bits.
++    const uint32_t bits[8] = {0x7fc01234, 0x80000000, 0x1, 0x3f800000, 0xbf800000, 0x7f800000, 0xff800000, 0};
++    auto write = [&](std::vector<int32_t> h, size_t payload, int copies = 1) {
++        std::ofstream f(file, std::ios::binary | std::ios::trunc);
++        for (int i = 0; i < copies; ++i) {
++            f.write((char*) h.data(), (std::streamsize) h.size() * 4);
++            f.write((char*) bits, (std::streamsize) payload);
++        }
++    };
++    write({0x31455653, 2, 2, 1, 4}, sizeof bits, 2);
++    check(records.open(file.string(), 4, 4, err), "map concatenated image records");
++    check(records.images().size() == 2 && records.floats() == 16, "row counts and widths");
++    for (const auto& im : records.images())
++        check(std::memcmp(im.data, bits, sizeof bits) == 0, "embedding floats are bit-identical");
++    fs::remove(file);
++    check(std::memcmp(records.images()[1].data, bits, sizeof bits) == 0, "mapping remains valid after unlink");
++    records.close();
++    records.close();
++    check(records.images().empty() && records.floats() == 0, "close is idempotent");
++    check(!records.open(file.string(), 4, 4, err), "missing file");
++    write({0x31455653, 2, 2, 1, 4}, sizeof bits, 2);
++    check(!records.open(file.string(), 4, 3, err), "sum of image rows cannot exceed the prompt");
++    check(records.images().empty() && records.floats() == 0, "failed open discards partial records");
++    for (const std::vector<int32_t>& h : std::vector<std::vector<int32_t>>{
++             {0, 2, 2, 1, 4}, {0x31455653, -1, 2, 1, 4}, {0x31455653, 2, 2, 2, 4},
++             {0x31455653, 2, 2, 1, 3}, {0x31455653, 2, 2, 1, 0},
++             {0x31455653, 0x7fffffff, 0x7fffffff, 1, 4}, {0x31455653, 2}}) {
++        write(h, sizeof bits);
++        check(!records.open(file.string(), 4, 4, err), "malformed record rejected before allocation");
++        check(!err.empty() && records.images().empty(), "malformed record leaves no mapped state");
++    }
++    write({0x31455653, 2, 2, 1, 4}, sizeof bits - 1);
++    check(!records.open(file.string(), 4, 4, err), "truncated payload");
++    write({}, 0);
++    check(!records.open(file.string(), 4, 4, err), "empty file");
++    write({0x31455653, 2, 2, 1, 4}, sizeof bits);
++    check(records.open(file.string(), 4, 2, err), "retry after malformed input succeeds");
++    records.close();
++    fs::remove(file);
++    std::printf("mapped vision records: %d checks passed\n", checks);
++}
+--- /dev/null
++++ b/tests/core/idle_gpu_shadows_test.cpp
+@@ -0,0 +1,86 @@
++#include "strata/core/idle_gpu_shadows.hpp"
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <sys/mman.h>
++#include <unistd.h>
++
++using namespace strata::core::detail;
++static int checks = 0;
++static void check(bool ok, const char* why) {
++    ++checks;
++    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", why); std::exit(1); }
++}
++static size_t rss_kib() {
++    size_t pages = 0, resident = 0;
++    std::ifstream("/proc/self/statm") >> pages >> resident;
++    return resident * (size_t) sysconf(_SC_PAGESIZE) / 1024;
++}
++static unsigned char pattern(size_t i) { return (unsigned char) ((i * 131 + (i >> 12) * 17) & 255); }
++int main() {
++    std::string error;
++    std::vector<GpuShadowRange> ranges;
++    std::vector<GpuShadowBlob> plan{{3, 4096, 4096, 3}, {2, 0, 4096, 2}};
++    check(gpu_shadow_ranges(0x100000, 12288, 4096, plan, ranges, error), "valid neighbour plan");
++    check(ranges.size() == 1 && ranges[0].offset == 0 && ranges[0].bytes == 8192, "merge only adjacent shadows");
++    plan = {{1, 11, 8192, 1}, {2, 12288, 4096, 2}};
++    check(gpu_shadow_ranges(0x100010, 24576, 4096, plan, ranges, error), "malloc-like unaligned base");
++    for (const auto& r : ranges) {
++        check((0x100010 + r.offset) % 4096 == 0, "absolute page alignment");
++        check(r.offset >= 11 && r.offset + r.bytes <= 16384, "never cross shadow boundaries");
++    }
++    plan = {{1, 0, 4096, 1}, {2, 2048, 4096, 2}};
++    check(!gpu_shadow_ranges(0x100000, 8192, 4096, plan, ranges, error), "reject overlapping blobs before reclaim");
++    plan = {{1, 8192, 4096, 1}};
++    check(!gpu_shadow_ranges(0x100000, 8192, 4096, plan, ranges, error), "reject outside allocation");
++
++    // A 192 MiB host arena, half CPU-only experts and half duplicated in simulated
++    // VRAM. The simulated VRAM is another anonymous mapping; this test does not
++    // claim to measure PCIe restore speed on an actual GPU.
++    constexpr size_t MiB = 1u << 20, total = 192 * MiB, half = total / 2;
++    auto* raw = (unsigned char*) mmap(nullptr, total + 4096, PROT_READ | PROT_WRITE,
++                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    auto* authoritative = (unsigned char*) mmap(nullptr, half, PROT_READ | PROT_WRITE,
++                                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    check(raw != MAP_FAILED && authoritative != MAP_FAILED, "allocate real anonymous mappings");
++    auto* host = raw + 16;
++    for (size_t i = 0; i < total; ++i) host[i] = pattern(i);
++    std::memcpy(authoritative, host + half, half);
++    const size_t before = rss_kib();
++    IdleGpuShadows shadows;
++    plan = {{7, half, half / 2, 1}, {9, half + half / 2, half / 2, 2}};
++    check(shadows.release(host, total, plan, error), "reclaim GPU duplicates");
++    const size_t idle = rss_kib();
++    check(shadows.active() && shadows.released_bytes() >= half - 8192, "reclaim nearly all duplicate pages");
++    check(shadows.missing(7) && shadows.missing(9) && !shadows.missing(1), "missing identity set");
++    bool same = true;
++    for (size_t i = 0; i < half; ++i) same &= host[i] == pattern(i);
++    check(same, "every CPU-only expert byte retained");
++    check(host[0] == pattern(0) && host[total - 1] == pattern(total - 1), "unaligned boundary bytes protected");
++    check(!shadows.release(host, total, plan, error), "cannot discard twice before restore");
++    check(!shadows.restore(host + 1, [](auto&, auto*, auto&) { return true; }, error), "allocation identity checked");
++    bool first = true;
++    check(!shadows.restore(host, [&](const auto& b, auto* dst, auto& e) {
++        if (!first) { e = "simulated device copy failure"; return false; }
++        first = false;
++        std::memcpy(dst, authoritative + b.offset - half, b.bytes);
++        return true;
++    }, error), "failed second device copy does not publish a full restore");
++    check(shadows.active() && shadows.missing(7), "failed restore remains guarded");
++    check(shadows.restore(host, [&](const auto& b, auto* dst, auto&) {
++        std::memcpy(dst, authoritative + b.offset - half, b.bytes); return true;
++    }, error), "retry restores all exact bytes");
++    same = true;
++    for (size_t i = 0; i < total; ++i) same &= host[i] == pattern(i);
++    check(same && !shadows.active() && error.empty(), "whole arena bit-identical after restore");
++    check(shadows.restore(host, [](auto&, auto*, auto&) { return false; }, error), "empty restore is a no-op");
++    plan = {{7, half, 4096, 1}, {7, half + 4096, 4096, 2}};
++    check(!shadows.release(host, total, plan, error), "duplicate identities rejected before data is touched");
++    plan = {{7, half, 1, 1}};
++    check(shadows.release(host, total, plan, error) && !shadows.active(), "subpage expert with no safe page stays resident");
++    std::printf("idle shadows: %d checks passed; fixture RSS before=%zu KiB idle=%zu KiB reduction=%.1f MiB\n",
++                checks, before, idle, (double) (before - idle) / 1024);
++    munmap(raw, total + 4096);
++    munmap(authoritative, half);
++}
+--- /dev/null
++++ b/serve/test_vision_memory.py
+@@ -0,0 +1,69 @@
++"""Image handoff must not allocate another whole embedding file in Python."""
++import errno
++import io
++import tempfile
++import unittest
++from pathlib import Path
++from unittest import mock
++
++from serve.server import Vision, combined_embeddings_path, write_temporary
++
++
++class VisionMemory(unittest.TestCase):
++    def test_single_image_is_shared_and_survives_cache_eviction(self):
++        with tempfile.TemporaryDirectory() as d:
++            source, target = Path(d) / "cached.sve", Path(d) / "request.sve"
++            source.write_bytes(b"unchanged encoder output")
++            with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("whole-file read")):
++                write_temporary(target, [source])
++            self.assertEqual(source.stat().st_ino, target.stat().st_ino)
++            source.unlink()
++            self.assertEqual(target.read_bytes(), b"unchanged encoder output")
++
++    def test_multiple_images_and_cross_device_fallback_stream_exact_bytes(self):
++        with tempfile.TemporaryDirectory() as d:
++            a, b, out = (Path(d) / n for n in ("a.sve", "b.sve", "out.sve"))
++            data = bytes(range(256)) * 10000
++            a.write_bytes(data)
++            b.write_bytes(b"last record")
++            for parts in ([a], [a, b]):
++                out.unlink(missing_ok=True)
++                with mock.patch("serve.server.os.link", side_effect=OSError(errno.EXDEV, "different filesystem")), \
++                        mock.patch.object(Path, "read_bytes", side_effect=AssertionError("whole-file read")):
++                    write_temporary(out, parts)
++                self.assertEqual(out.read_bytes(), data + (b"last record" if len(parts) == 2 else b""))
++
++    def test_streaming_reads_are_bounded(self):
++        class BoundedReader(io.BytesIO):
++            def read(self, n=-1):
++                if not 0 < n <= 1 << 20:
++                    raise AssertionError(f"unbounded read: {n}")
++                return super().read(n)
++        with tempfile.TemporaryDirectory() as d, \
++                mock.patch.object(Path, "open", side_effect=lambda *a, **k: BoundedReader(b"abc" * 1000000)):
++            out = Path(d) / "out"
++            write_temporary(out, [Path("one"), Path("two")])
++            with open(out, "rb") as f:
++                self.assertEqual(f.read(), b"abc" * 2000000)
++
++    def test_disk_handoff_does_not_select_shm(self):
++        with tempfile.TemporaryDirectory() as d, \
++                mock.patch("serve.server.shutil.disk_usage", side_effect=AssertionError("must not probe shm")):
++            self.assertEqual(combined_embeddings_path(Path(d), 1 << 30, prefer_memory=False).parent, Path(d))
++
++    def test_explicit_work_directory_and_cleanup(self):
++        with tempfile.TemporaryDirectory() as d:
++            vision = Vision({"exe": "strata-vision", "mmproj": "m", "model": "t", "work_dir": d,
++                             "memory_efficient": True}, lazy=True)
++            self.assertEqual(vision.dir.parent, Path(d))
++            self.assertTrue(vision.memory_efficient)
++            vision.shutdown()
++            self.assertFalse(vision.dir.exists())
++            with self.assertRaises(OSError):
++                Vision.work_dir(str(Path(d) / "missing"))
++            with self.assertRaises(ValueError):
++                Vision.work_dir(str(Path(d) / "has space"))
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- /dev/null
++++ b/serve/runtime_memory.py
+@@ -0,0 +1,62 @@
++"""Read Linux paging/VRAM counters. No process inspection tools or extra packages required."""
++from pathlib import Path
++import time
++
++
++def _counters(path):
++    result = {}
++    for line in path.read_text().splitlines():
++        key, sep, value = line.partition(":")
++        if sep:
++            fields = value.split()
++            if fields:
++                try:
++                    result[key] = int(fields[0])
++                except ValueError:
++                    pass
++    return result
++
++
++def sample_runtime_memory(pid, proc_root=Path("/proc"), drm_root=Path("/sys/class/drm")):
++    """Counters are cumulative; the caller computes deltas only within the same PID."""
++    proc = Path(proc_root) / str(pid)
++    try:
++        # comm may contain spaces and parentheses. Fields after its final ')' start at field 3.
++        stat = (proc / "stat").read_text().rsplit(")", 1)[1].split()
++        sample = {"pid": pid, "time": time.time(), "major_faults": int(stat[9])}
++        status = _counters(proc / "status")
++    except (OSError, ValueError, IndexError):
++        return None
++    for key in ("VmRSS", "RssAnon", "RssFile", "RssShmem", "VmSwap"):
++        if key in status:
++            sample[key + "_kib"] = status[key]
++    try:
++        io = _counters(proc / "io")
++        if "read_bytes" in io:
++            sample["read_bytes"] = io["read_bytes"]
++    except OSError:
++        pass
++    try:
++        mem = _counters(Path(proc_root) / "meminfo")
++        if "MemAvailable" in mem:
++            sample["available_kib"] = mem["MemAvailable"]
++    except OSError:
++        pass
++    cards = []
++    for card in sorted(Path(drm_root).glob("card[0-9]*")):
++        # Skip connector entries, e.g. card0-DP-1.
++        if not card.name[4:].isdigit():
++            continue
++        reading = {"card": card.name}
++        for source, target in (("mem_info_vram_used", "vram_used_bytes"),
++                               ("mem_info_gtt_used", "gtt_used_bytes"),
++                               ("gpu_busy_percent", "busy_percent")):
++            try:
++                reading[target] = int((card / "device" / source).read_text().strip())
++            except (OSError, ValueError):
++                pass
++        if len(reading) > 1:
++            cards.append(reading)
++    if cards:
++        sample["amd_cards"] = cards
++    return sample
+--- /dev/null
++++ b/serve/test_resident_recovery.py
+@@ -0,0 +1,138 @@
++import contextlib
++import io
++import json
++import os
++from pathlib import Path
++import signal
++import subprocess
++import sys
++import tempfile
++from types import SimpleNamespace
++import unittest
++from unittest import mock
++
++from serve.runtime_memory import sample_runtime_memory
++from serve.server import Service, StrataEngine, Vision
++from tools.recover_fast_resident import recover
++
++
++class ResidentRecovery(unittest.TestCase):
++    def test_recovery_only_changes_storage_override_and_diagnostics(self):
++        with tempfile.TemporaryDirectory() as d:
++            path = Path(d) / "strata-coder-uncen-iq1_m.json"
++            before = {"args": ["--resident-experts", "--max-context", "131072", "--prefill", "auto", "--spec", "4"],
++                      "env": {"STRATA_RESIDENT_FILE_DIR": "/ssd", "STRATA_RESIDENT_HEADROOM_GIB": "8"},
++                      "vision": {"gpu": False, "max_tokens": 300, "threads": 8}, "log": "/active-uncen.log"}
++            path.write_text(json.dumps(before))
++            mode = path.stat().st_mode
++            result, backup = recover(path)
++            self.assertEqual(json.loads(backup.read_text()), before)
++            self.assertEqual(result["args"], before["args"])
++            self.assertEqual(result["vision"], before["vision"])
++            self.assertEqual(result["env"]["STRATA_RESIDENT_HEADROOM_GIB"], "8")
++            self.assertEqual(result["env"]["STRATA_RESIDENT_FILE_DIR"], "")
++            self.assertTrue(result["runtime_memory_log"])
++            self.assertEqual(path.stat().st_mode, mode)
++            self.assertEqual(json.loads(path.read_text()), result)
++            self.assertEqual(list(Path(d).glob(".strata-recovery-*")), [])
++
++    def test_invalid_config_is_not_modified(self):
++        with tempfile.TemporaryDirectory() as d:
++            path = Path(d) / "config.json"
++            original = '{"args": ["--different-mode"]}'
++            path.write_text(original)
++            with self.assertRaises(ValueError):
++                recover(path)
++            self.assertEqual(path.read_text(), original)
++            self.assertEqual(list(Path(d).iterdir()), [path])
++
++    @unittest.skipIf(os.name == "nt", "POSIX signal return codes")
++    def test_interruption_does_not_become_an_oom_or_old_watchdog_report(self):
++        with tempfile.TemporaryDirectory() as d:
++            log = Path(d) / "engine.log"
++            log.write_text("strata: issue #29 from an earlier start\n")
++            engine = StrataEngine.__new__(StrataEngine)
++            engine.log_path = str(log)
++            for signum in (signal.SIGINT, signal.SIGTERM):
++                engine.proc = SimpleNamespace(poll=lambda: -signum)
++                note = engine.death_note()
++                self.assertIn(signal.Signals(signum).name, note)
++                self.assertNotIn("usual cause", note)
++                self.assertNotIn("smaller model", note)
++                self.assertNotIn("hang it caught", note)
++
++    def test_vision_close_after_child_exit_closes_buffered_pipes(self):
++        proc = subprocess.Popen([sys.executable, "-c", "pass"], stdin=subprocess.PIPE,
++                                stdout=subprocess.PIPE, text=True)
++        proc.wait(timeout=10)
++        vision = Vision.__new__(Vision)
++        vision.proc, vision.stopped = proc, False
++        vision.close()
++        self.assertTrue(proc.stdin.closed)
++        self.assertTrue(proc.stdout.closed)
++        self.assertTrue(vision.stopped)
++        self.assertIsNone(vision.proc)
++        vision.close()
++
++
++class RuntimeMemory(unittest.TestCase):
++    def fixture(self, d):
++        root = Path(d)
++        proc = root / "proc/123"
++        proc.mkdir(parents=True)
++        (proc / "stat").write_text("123 (name with ) and spaces) S 1 2 3 4 5 6 50 60 70 80\n")
++        (proc / "status").write_text("VmRSS: 1024 kB\nRssAnon: 900 kB\nRssFile: 124 kB\nVmSwap: 456 kB\n")
++        (proc / "io").write_text("read_bytes: 777\nrchar: 888\n")
++        (root / "proc/meminfo").write_text("MemAvailable: 999 kB\n")
++        gpu = root / "drm/card1/device"
++        gpu.mkdir(parents=True)
++        (gpu / "mem_info_vram_used").write_text("123456")
++        (gpu / "mem_info_gtt_used").write_text("654321")
++        (gpu / "gpu_busy_percent").write_text("17")
++        return root
++
++    def test_reads_engine_faults_swap_disk_and_amd_counters(self):
++        with tempfile.TemporaryDirectory() as d:
++            root = self.fixture(d)
++            sample = sample_runtime_memory(123, root / "proc", root / "drm")
++            self.assertEqual(sample["major_faults"], 70)
++            self.assertEqual(sample["VmSwap_kib"], 456)
++            self.assertEqual(sample["RssAnon_kib"], 900)
++            self.assertEqual(sample["read_bytes"], 777)
++            self.assertEqual(sample["available_kib"], 999)
++            self.assertEqual(sample["amd_cards"][0]["gtt_used_bytes"], 654321)
++            self.assertEqual(sample["amd_cards"][0]["busy_percent"], 17)
++
++    def test_missing_optional_counters_are_unknown_not_zero(self):
++        with tempfile.TemporaryDirectory() as d:
++            root = self.fixture(d)
++            (root / "proc/123/io").unlink()
++            (root / "proc/meminfo").unlink()
++            sample = sample_runtime_memory(123, root / "proc", root / "missing-drm")
++            for key in ("read_bytes", "available_kib", "amd_cards", "RssShmem_kib"):
++                self.assertNotIn(key, sample)
++            self.assertIsNone(sample_runtime_memory(999, root / "proc", root / "drm"))
++
++    def test_throttled_log_uses_running_engine_log_and_counter_deltas(self):
++        with tempfile.TemporaryDirectory() as d:
++            svc = Service.__new__(Service)
++            log = Path(d) / "active-coder-uncen.log"
++            svc.engine = SimpleNamespace(proc=SimpleNamespace(pid=123), log_path=log)
++            readings = [{"pid": 123, "major_faults": 10, "read_bytes": 100},
++                        {"pid": 123, "major_faults": 40, "read_bytes": 300}]
++            with mock.patch("serve.server.time.monotonic", side_effect=[10, 11, 21]), \
++                    mock.patch("serve.runtime_memory.sample_runtime_memory", side_effect=readings) as sampler, \
++                    contextlib.redirect_stdout(io.StringIO()):
++                svc._log_runtime_memory()
++                svc._log_runtime_memory()
++                svc._log_runtime_memory()
++            self.assertEqual(sampler.call_count, 2)
++            lines = log.read_text().splitlines()
++            self.assertEqual(len(lines), 2)
++            result = json.loads(lines[-1].split(": ", 1)[1])
++            self.assertEqual(result["major_faults_delta"], 30)
++            self.assertEqual(result["read_bytes_delta"], 200)
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- /dev/null
++++ b/tools/rebuild-memory-fix.sh
+@@ -0,0 +1,72 @@
++#!/usr/bin/env bash
++# Build on the AMD PC; the archive's pre-existing engine binary is not this build.
++set -euo pipefail
++strata_root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
++strata_build="$strata_root/build-memory-fix-hip"
++strata_vision_build="$strata_root/build-memory-fix-vision"
++strata_arch="${STRATA_HIP_ARCH:-gfx1030}"
++strata_jobs="${STRATA_BUILD_JOBS:-2}"
++
++if ! command -v cmake >/dev/null; then
++    printf '%s\n' 'cmake is required. Activate the existing Strata .venv, or install cmake, then retry.' >&2
++    exit 1
++fi
++if [[ ! -f "$strata_root/third_party/llama.cpp/ggml/CMakeLists.txt" ]]; then
++    printf '%s\n' 'The bundled third_party/llama.cpp checkout is missing.' >&2
++    exit 1
++fi
++
++# gfx1030 and MMQ=ON match the supplied build-hip/CMakeCache.txt. Use a fresh
++# folder: the uploaded build cache contains paths and compilers from another PC.
++cmake -S "$strata_root" -B "$strata_build" \
++    -DCMAKE_BUILD_TYPE=Release \
++    -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF \
++    -DCMAKE_HIP_ARCHITECTURES="$strata_arch" \
++    -DSTRATA_PREFILL_MMQ=ON -DSTRATA_PORTABLE=OFF \
++    -DSTRATA_BUILD_TESTS=OFF -DSTRATA_BUILD_CONVERSATION_TESTS=OFF \
++    -DSTRATA_GGML_DIR="$strata_root/third_party/llama.cpp"
++cmake --build "$strata_build" --target strata -j "$strata_jobs"
++"$strata_build/strata" --help >/dev/null 2>&1
++
++# The encoder needs the matching mtmd workspace-release API. Keep its old native
++# compiler where available instead of reusing an uploaded absolute build cache.
++strata_vision_compilers=()
++for strata_language in C CXX; do
++    strata_compiler=""
++    if [[ -f "$strata_root/build-vision/CMakeCache.txt" ]]; then
++        strata_compiler="$(sed -n "s/^CMAKE_${strata_language}_COMPILER:FILEPATH=//p" "$strata_root/build-vision/CMakeCache.txt")"
++    fi
++    if [[ -n "$strata_compiler" && -x "$strata_compiler" ]]; then
++        strata_vision_compilers+=("-DCMAKE_${strata_language}_COMPILER=$strata_compiler")
++    fi
++done
++cmake -S "$strata_root/tools/vision" -B "$strata_vision_build" \
++    -DCMAKE_BUILD_TYPE=Release -DSTRATA_PORTABLE=OFF -DSTRATA_VISION_CUDA=OFF \
++    -DSTRATA_VISION_WORKSPACE_TESTS=OFF \
++    -DLLAMA_DIR="$strata_root/third_party/llama.cpp" "${strata_vision_compilers[@]}"
++cmake --build "$strata_vision_build" --target strata-vision -j "$strata_jobs"
++"$strata_vision_build/bin/strata-vision" --help >/dev/null 2>&1
++
++mkdir -p "$strata_root/engine"
++strata_new="$(mktemp "$strata_root/engine/.strata-new.XXXXXX")"
++strata_vision_new="$(mktemp "$strata_root/engine/.strata-vision-new.XXXXXX")"
++trap 'rm -f -- "$strata_new" "$strata_vision_new"' EXIT
++cp -- "$strata_build/strata" "$strata_new"
++cp -- "$strata_vision_build/bin/strata-vision" "$strata_vision_new"
++chmod 755 "$strata_new" "$strata_vision_new"
++for strata_binary in strata strata-vision; do
++    if [[ -f "$strata_root/engine/$strata_binary" ]]; then
++        strata_backup="$(mktemp "$strata_root/engine/$strata_binary.pre-memory-fix.XXXXXX")"
++        cp -p -- "$strata_root/engine/$strata_binary" "$strata_backup"
++        printf 'Previous binary saved as %s\n' "$strata_backup"
++    fi
++done
++mv -f -- "$strata_new" "$strata_root/engine/strata"
++mv -f -- "$strata_vision_new" "$strata_root/engine/strata-vision"
++if [[ -f "$strata_root/strata-coder-uncen-iq1_m.json" ]]; then
++    strata_python=python3
++    if [[ -x "$strata_root/.venv/bin/python" ]]; then strata_python="$strata_root/.venv/bin/python"; fi
++    "$strata_python" "$strata_root/tools/configure_memory_lifecycle.py"
++fi
++printf '%s\n' 'Built and installed the engine and CPU vision encoder.' \
++    'Start the existing run-coder-uncen-iq1_m.sh launcher after stopping the old server.'
+--- /dev/null
++++ b/tools/test_rebuild_memory_fix.py
+@@ -0,0 +1,95 @@
++"""The rebuild must install only after a successful build and preserve the previous engine."""
++import os
++import json
++import shutil
++import subprocess
++import tempfile
++import unittest
++from pathlib import Path
++
++
++class RebuildMemoryFix(unittest.TestCase):
++    def run_rebuild(self, fail=False, fail_vision=False, with_profile=False):
++        script = Path(__file__).with_name("rebuild-memory-fix.sh")
++        with tempfile.TemporaryDirectory() as d:
++            root = Path(d) / "Strata project"
++            (root / "tools").mkdir(parents=True)
++            (root / "engine").mkdir()
++            (root / "third_party/llama.cpp/ggml").mkdir(parents=True)
++            (root / "third_party/llama.cpp/ggml/CMakeLists.txt").touch()
++            shutil.copyfile(script, root / "tools/rebuild-memory-fix.sh")
++            old = root / "engine/strata"
++            old.write_text("old engine bytes")
++            old_vision = root / "engine/strata-vision"
++            old_vision.write_text("old vision bytes")
++            profile = None
++            if with_profile:
++                shutil.copyfile(script.with_name("configure_memory_lifecycle.py"), root / "tools/configure_memory_lifecycle.py")
++                profile = {"exe": str(old), "args": ["--resident-experts", "--max-context", "131072"],
++                           "vision": {"exe": str(old_vision), "gpu": False, "max_tokens": 300}}
++                (root / "strata-coder-uncen-iq1_m.json").write_text(json.dumps(profile))
++            bindir = Path(d) / "bin"
++            bindir.mkdir()
++            cmake = bindir / "cmake"
++            cmake.write_text('''#!/bin/bash
++set -eu
++if [[ "$1" == "--build" ]]; then
++    [[ "${STRATA_TEST_FAIL:-0}" == "0" ]] || exit 42
++    if [[ "$4" == "strata-vision" ]]; then
++        [[ "${STRATA_TEST_FAIL_VISION:-0}" == "0" ]] || exit 43
++        mkdir -p "$2/bin"
++        printf '#!/bin/sh\\n# --release-workspace\\nexit 0\\n' > "$2/bin/strata-vision"
++        chmod +x "$2/bin/strata-vision"
++    else
++        mkdir -p "$2"
++        printf '#!/bin/sh\\n# STRATA_MEMORY_LIFECYCLE idle GPU shadows: live ownership v2\\nexit 0\\n' > "$2/strata"
++        chmod +x "$2/strata"
++    fi
++fi
++''')
++            cmake.chmod(0o755)
++            env = {**os.environ, "PATH": str(bindir) + os.pathsep + os.environ["PATH"],
++                   "STRATA_TEST_FAIL": "1" if fail else "0",
++                   "STRATA_TEST_FAIL_VISION": "1" if fail_vision else "0"}
++            result = subprocess.run(["bash", str(root / "tools/rebuild-memory-fix.sh")], env=env,
++                                    capture_output=True, text=True)
++            backups = list((root / "engine").glob("strata.pre-memory-fix.*"))
++            if fail or fail_vision:
++                self.assertEqual(result.returncode, 42 if fail else 43, result.stderr)
++                self.assertEqual(old.read_text(), "old engine bytes")
++                self.assertEqual(old_vision.read_text(), "old vision bytes")
++                self.assertEqual(backups, [])
++                if with_profile:
++                    self.assertEqual(json.loads((root / "strata-coder-uncen-iq1_m.json").read_text()), profile)
++            else:
++                self.assertEqual(result.returncode, 0, result.stderr)
++                self.assertEqual(len(backups), 1)
++                self.assertEqual(backups[0].read_text(), "old engine bytes")
++                self.assertTrue(os.access(old, os.X_OK))
++                self.assertEqual(old.read_text(), "#!/bin/sh\n# STRATA_MEMORY_LIFECYCLE idle GPU shadows: live ownership v2\nexit 0\n")
++                vision_backups = list((root / "engine").glob("strata-vision.pre-memory-fix.*"))
++                self.assertEqual(len(vision_backups), 1)
++                self.assertEqual(vision_backups[0].read_text(), "old vision bytes")
++                self.assertEqual(old_vision.read_text(), "#!/bin/sh\n# --release-workspace\nexit 0\n")
++                if with_profile:
++                    cfg = json.loads((root / "strata-coder-uncen-iq1_m.json").read_text())
++                    self.assertEqual(cfg["args"], profile["args"])
++                    self.assertEqual(cfg["env"]["STRATA_MEMORY_LIFECYCLE"], "1")
++                    self.assertTrue(cfg["vision"]["release_workspace"])
++                self.assertEqual(list((root / "engine").glob(".strata-new.*")), [])
++
++    def test_success_preserves_backup(self):
++        self.run_rebuild()
++
++    def test_failed_build_preserves_engine(self):
++        self.run_rebuild(fail=True)
++
++    def test_failed_vision_build_preserves_both_binaries(self):
++        self.run_rebuild(fail_vision=True, with_profile=True)
++
++    def test_both_binaries_installed_before_profile_is_enabled(self):
++        self.run_rebuild(with_profile=True)
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- /dev/null
++++ b/tools/recover_fast_resident.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++"""Disable the regressing SSD expert mode without rebuilding or changing inference args."""
++import argparse
++import copy
++import json
++import os
++from pathlib import Path
++import shutil
++import tempfile
++import time
++
++
++def recover(config_path):
++    path = Path(config_path).resolve()
++    original = json.loads(path.read_text(encoding="utf-8"))
++    if "--resident-experts" not in original.get("args", []):
++        raise ValueError("Expected --resident-experts; this tool did not change the config")
++    cfg = copy.deepcopy(original)
++    if not isinstance(cfg.get("env", {}), dict):
++        raise ValueError("The config env must be an object")
++    # An empty override defeats an inherited export too; deleting this key would not.
++    cfg.setdefault("env", {})["STRATA_RESIDENT_FILE_DIR"] = ""
++    cfg["runtime_memory_log"] = True
++    assert cfg["args"] == original["args"]
++    assert cfg.get("vision") == original.get("vision")
++    backup = path.with_name(path.name + ".before-resident-recovery-" + str(time.time_ns()))
++    shutil.copy2(path, backup)
++    fd, temporary = tempfile.mkstemp(prefix=".strata-recovery-", dir=path.parent)
++    try:
++        with os.fdopen(fd, "w", encoding="utf-8") as f:
++            json.dump(cfg, f, indent=2)
++            f.write("\n")
++            f.flush()
++            os.fsync(f.fileno())
++        shutil.copymode(path, temporary)
++        os.replace(temporary, path)
++    finally:
++        Path(temporary).unlink(missing_ok=True)
++    return cfg, backup
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument("--config", type=Path,
++                    default=Path(__file__).resolve().parents[1] / "strata-coder-uncen-iq1_m.json")
++    args = ap.parse_args()
++    try:
++        cfg, backup = recover(args.config)
++    except (OSError, ValueError, KeyError) as error:
++        ap.exit(1, str(error) + "\n")
++    print("Disabled SSD-backed experts; the current engine can use its original RAM path without rebuilding.")
++    print("Inference arguments and all vision settings preserved.")
++    print("Config backup:", backup)
++    print("Active engine log:", cfg.get("log", "(no log configured)"))
++    print("Stop the current Strata server, then start your usual run-coder-uncen-iq1_m.sh launcher.")
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null
++++ b/tools/configure_memory_lifecycle.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++"""Enable memory lifecycle reuse after both matching binaries have been built."""
++import argparse
++import copy
++import json
++import os
++from pathlib import Path
++import shutil
++import tempfile
++import time
++
++
++def configure(path, validate_binaries=True):
++    path = Path(path).resolve()
++    original = json.loads(path.read_text())
++    if "--resident-experts" not in original.get("args", []):
++        raise ValueError("Memory lifecycle reuse requires the existing --resident-experts mode")
++    vision = original.get("vision")
++    if not isinstance(vision, dict) or vision.get("gpu"):
++        raise ValueError("This profile is for the existing CPU vision encoder")
++    if validate_binaries:
++        for binary, marker in ((original["exe"], b"idle GPU shadows: live ownership v2"),
++                               (vision["exe"], b"--release-workspace")):
++            p = Path(binary)
++            if not p.is_absolute():
++                p = Path(original.get("cwd") or path.parent) / p
++            if marker not in p.read_bytes():
++                raise ValueError(f"{p} must be rebuilt before enabling this profile")
++    cfg = copy.deepcopy(original)
++    if cfg.get("env") is None:
++        cfg["env"] = {}
++    if not isinstance(cfg["env"], dict):
++        raise ValueError("The config env must be an object")
++    cfg["env"]["STRATA_RESIDENT_FILE_DIR"] = ""
++    cfg["env"]["STRATA_MEMORY_LIFECYCLE"] = "1"
++    cfg["vision"]["release_workspace"] = True
++    cfg["runtime_memory_log"] = True
++    assert cfg["args"] == original["args"]
++    assert all(cfg["vision"][k] == v for k, v in vision.items() if k != "release_workspace")
++    backup = path.with_name(path.name + ".before-memory-lifecycle-" + str(time.time_ns()))
++    shutil.copy2(path, backup)
++    fd, temporary = tempfile.mkstemp(prefix=".strata-memory-profile-", dir=path.parent)
++    try:
++        with os.fdopen(fd, "w") as f:
++            json.dump(cfg, f, indent=2)
++            f.write("\n")
++            f.flush()
++            os.fsync(f.fileno())
++        shutil.copymode(path, temporary)
++        os.replace(temporary, path)
++    finally:
++        Path(temporary).unlink(missing_ok=True)
++    return cfg, backup
++
++
++if __name__ == "__main__":
++    ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument("--config", type=Path,
++                    default=Path(__file__).resolve().parents[1] / "strata-coder-uncen-iq1_m.json")
++    args = ap.parse_args()
++    try:
++        cfg, backup = configure(args.config)
++    except (OSError, ValueError, KeyError) as error:
++        ap.exit(1, str(error) + "\n")
++    print("Memory lifecycle reuse enabled; inference arguments and image settings preserved.")
++    print("Config backup:", backup)
++    print("Run log:", cfg.get("log", "(none configured)"))
+--- /dev/null
++++ b/tools/test_configure_memory_lifecycle.py
+@@ -0,0 +1,63 @@
++import json
++from pathlib import Path
++import tempfile
++import unittest
++from tools.configure_memory_lifecycle import configure
++
++
++class MemoryProfile(unittest.TestCase):
++    def fixture(self, d):
++        root = Path(d)
++        engine, encoder = root / "strata", root / "strata-vision"
++        engine.write_bytes(b"STRATA_MEMORY_LIFECYCLE idle GPU shadows: live ownership v2")
++        encoder.write_bytes(b"--release-workspace")
++        cfg = {"exe": str(engine), "args": ["--resident-experts", "--max-context", "131072", "--kv", "int8",
++                                              "--prefill", "auto", "--spec", "4"],
++               "env": {"STRATA_RESIDENT_HEADROOM_GIB": "8"},
++               "vision": {"exe": str(encoder), "gpu": False, "max_tokens": 300, "threads": 8}}
++        p = root / "config.json"
++        p.write_text(json.dumps(cfg))
++        return p, cfg, encoder
++
++    def test_enable_preserves_inference_and_vision_values(self):
++        with tempfile.TemporaryDirectory() as d:
++            p, before, _ = self.fixture(d)
++            after, backup = configure(p)
++            self.assertEqual(after["args"], before["args"])
++            self.assertTrue(all(after["vision"][k] == v for k, v in before["vision"].items()))
++            self.assertEqual(after["env"]["STRATA_RESIDENT_HEADROOM_GIB"], "8")
++            self.assertEqual(after["env"]["STRATA_RESIDENT_FILE_DIR"], "")
++            self.assertEqual(after["env"]["STRATA_MEMORY_LIFECYCLE"], "1")
++            self.assertTrue(after["vision"]["release_workspace"])
++            self.assertEqual(json.loads(backup.read_text()), before)
++
++    def test_old_encoder_cannot_enable_an_unsupported_option(self):
++        with tempfile.TemporaryDirectory() as d:
++            p, before, encoder = self.fixture(d)
++            encoder.write_bytes(b"older encoder")
++            with self.assertRaisesRegex(ValueError, "rebuilt"):
++                configure(p)
++            self.assertEqual(json.loads(p.read_text()), before)
++            self.assertEqual(list(p.parent.glob("*.before-memory-lifecycle-*")), [])
++
++    def test_gpu_vision_is_not_silently_changed_to_cpu(self):
++        with tempfile.TemporaryDirectory() as d:
++            p, before, _ = self.fixture(d)
++            before["vision"]["gpu"] = True
++            p.write_text(json.dumps(before))
++            with self.assertRaises(ValueError):
++                configure(p)
++            self.assertEqual(json.loads(p.read_text()), before)
++
++    def test_previous_unsafe_engine_cannot_enable_profile(self):
++        with tempfile.TemporaryDirectory() as d:
++            p, before, _ = self.fixture(d)
++            Path(before["exe"]).write_bytes(b"STRATA_MEMORY_LIFECYCLE")
++            with self.assertRaisesRegex(ValueError, "rebuilt"):
++                configure(p)
++            self.assertEqual(json.loads(p.read_text()), before)
++            self.assertEqual(list(p.parent.glob("*.before-memory-lifecycle-*")), [])
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- /dev/null
++++ b/tools/vision/cpu_workspace_test.cpp
+@@ -0,0 +1,91 @@
++// White-box integration test: compile the actual clip.cpp implementation here so
++// the private context can be tested without downloading a multimodal model. The
++// static mtmd library supplies the other objects; its clip.o is not pulled in.
++#include "../../third_party/llama.cpp/tools/mtmd/clip.cpp"
++#include <cstdio>
++#include <cstdlib>
++#include <fstream>
++#if defined(__linux__) && defined(__GLIBC__)
++#include <malloc.h>
++#endif
++#if defined(__linux__)
++#include <unistd.h>
++#endif
++
++static void check(bool ok, const char* why) {
++    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", why); std::exit(1); }
++}
++static size_t rss_kib() {
++#if defined(__linux__)
++    size_t pages = 0, rss = 0;
++    std::ifstream("/proc/self/statm") >> pages >> rss;
++    return rss * (size_t) sysconf(_SC_PAGESIZE) / 1024;
++#else
++    return 0;
++#endif
++}
++int main() {
++    llama_backend_init();
++    size_t callbacks = 0;
++    clip_context_params params{};
++    params.flash_attn_type = CLIP_FLASH_ATTN_TYPE_DISABLED;
++    params.cb_eval = [](ggml_tensor*, bool, void* p) { ++*(size_t*) p; return false; };
++    params.cb_eval_user_data = &callbacks;
++    clip_ctx ctx(params);
++    ctx.ctx_data.reset(ggml_init({1 << 20, nullptr, true}));
++    check(ctx.ctx_data != nullptr, "weight metadata context");
++    ggml_tensor* weight = ggml_new_tensor_1d(ctx.ctx_data.get(), GGML_TYPE_F32, 1);
++    ctx.buf.reset(ggml_backend_alloc_ctx_tensors(ctx.ctx_data.get(), ctx.backend_cpu));
++    check(ctx.buf != nullptr, "persistent model-weight buffer");
++    const float value = 3.5f;
++    ggml_backend_tensor_set(weight, &value, 0, sizeof value);
++    void* weight_address = weight->data;
++    const size_t count = 16 * 1024 * 1024;  // 64 MiB input + 64 MiB output
++    uint64_t expected_hash = 0;
++    for (int round = 0; round < 3; ++round) {
++        ggml_context_ptr graph_ctx(ggml_init({4 << 20, nullptr, true}));
++        check(graph_ctx != nullptr, "graph metadata context");
++        ggml_tensor* input = ggml_new_tensor_1d(graph_ctx.get(), GGML_TYPE_F32, count);
++        ggml_set_input(input);
++        ggml_tensor* output = ggml_add(graph_ctx.get(), input, weight);
++        ggml_tensor* second = ggml_scale(graph_ctx.get(), input, 2.0f);
++        ggml_set_output(output);
++        ggml_set_output(second);
++        auto* graph = ggml_new_graph_custom(graph_ctx.get(), 1024, false);
++        ggml_build_forward_expand(graph, second);
++        ggml_build_forward_expand(graph, output);
++        check(ggml_backend_sched_alloc_graph(ctx.sched.get(), graph), "allocate real GGML CPU scratch");
++        for (size_t i = 0; i < count; ++i) ((float*) input->data)[i] = (float) (i % 16) / 4;
++        ggml_backend_cpu_set_n_threads(ctx.backend_cpu, 4);
++        check(ggml_backend_sched_graph_compute(ctx.sched.get(), graph) == GGML_STATUS_SUCCESS, "compute actual GGML graph");
++        uint64_t hash = 14695981039346656037ull;
++        bool same = true;
++        for (size_t i = 0; i < count; ++i) {
++            const float wanted = (float) (i % 16) / 4 + value;
++            same &= ((float*) output->data)[i] == wanted;
++            same &= ((float*) second->data)[i] == ((float) (i % 16) / 4) * 2;
++            uint32_t bits; std::memcpy(&bits, (float*) output->data + i, sizeof bits);
++            hash = (hash ^ bits) * 1099511628211ull;
++        }
++        check(same, "every computed float matches");
++        if (!round) expected_hash = hash;
++        check(hash == expected_hash, "output bits repeat after scratch is rebuilt");
++        ctx.is_allocated = true;
++        const size_t before = rss_kib();
++        const size_t freed = clip_release_cpu_work_buffers(&ctx);
++#if defined(__linux__) && defined(__GLIBC__)
++        malloc_trim(0);
++#endif
++        const size_t after = rss_kib();
++        check(freed >= count * sizeof(float) * 2, "large graph scratch released");
++        check(!ctx.is_allocated && weight->data == weight_address, "weights stay resident at the same address");
++        check(*(float*) weight->data == value, "weight bits retained");
++        check(ctx.flash_attn_type == CLIP_FLASH_ATTN_TYPE_DISABLED, "attention selection retained");
++        check(clip_release_cpu_work_buffers(&ctx) == 0, "repeated release is a no-op");
++        std::printf("workspace round %d: freed=%zu bytes RSS before=%zu KiB after=%zu KiB hash=%016llx\n",
++                    round, freed, before, after, (unsigned long long) hash);
++    }
++    check(callbacks >= 3, "evaluation callback survives scheduler replacement");
++    check(clip_release_cpu_work_buffers(nullptr) == 0, "null context");
++    std::puts("CPU workspace integration: passed");
++}
+--- /dev/null
++++ b/docs/MEMORY_FIX.md
+@@ -0,0 +1,142 @@
++# Strata memory lifecycle changes
++
++**Ownership correction (26 October 2026):** the earlier revision incorrectly used
++`ExpertCache::slot_of()` after adaptive swaps. That table retains the startup profile;
++serve's `host_res` is the live owner table. The old path could discard CPU-only weights
++and then restore a different expert from the old slot. This is a correctness bug and
++can cause repetitive or incoherent generation. Use the corrected revision described in
++`REPETITION_FIX.md`; restart the engine and begin a new chat after installing it.
++
++This revision changes which allocations coexist. Active CPU expert weights remain in anonymous RAM.
++It adds no SSD expert tier and does not lower model, context, KV, prefill, cache-count, speculation or image settings.
++
++## Install this revision
++
++Stop the running server. Extract `Strata-memory-lifecycle.zip` into `/mnt/ssd`; it contains `Strata/`.
++Then run:
++
++```bash
++cd /mnt/ssd/Strata
++source .venv/bin/activate
++bash tools/rebuild-memory-fix.sh
++bash run-coder-uncen-iq1_m.sh
++```
++
++**Both the engine and vision encoder must be rebuilt.** The script builds both before installing either,
++checks both executables can start with `--help`, saves both previous binaries, and then enables the memory
++profile in your current Coder Uncen config. It preserves the previous CPU encoder compiler from the existing
++`build-vision/CMakeCache.txt` when that compiler is available. The HIP build keeps gfx1030, native CPU code
++and MMQ prefill enabled, matching the uploaded project.
++
++The existing Coder Uncen config is backed up before an atomic update. The profile helper verifies that both
++installed binaries support the new options before enabling them. Source-archive configs leave the new modes
++off until this succeeds, so the old binaries cannot accidentally receive an unsupported vision option.
++
++The modified code is source, not an AMD executable built in this workspace. The existing `engine/` binaries
++in the full project archive predate these changes; use the rebuild script rather than running them directly.
++The current project paths remain `/mnt/ssd/Strata` and `/mnt/ssd/Strata-data`.
++
++## 1. Release duplicate host expert pages only while idle
++
++The resident expert complement can also contain host copies of GPU-cache experts. Prefill needs those copies
++when it borrows the cache's VRAM as scratch, but retaining them while idle makes CPU vision coexist with
++unneeded duplicate allocations.
++
++With `STRATA_MEMORY_LIFECYCLE=1`, on the single-GPU resident serve path:
++
++1. Finish pending default adaptive exchanges and require every prefill loan to have been returned.
++2. Find only experts present in both the pageable host complement and the primary GPU cache, using
++   serve's **live `host_res` table**, after pending exchanges have landed. Validate its shape, slot bounds
++   and unique ownership before discarding any host page. The startup `ExpertCache::slot_of()` table must
++   never be used here: adaptive swaps update `host_res`, not that table.
++3. At startup, or after control commands that can relayout scratch, refresh those VRAM copies from the still-valid
++   host bytes. Cache ownership metadata alone is insufficient: prefill initialization may have written scratch
++   into tail slots. This step establishes a valid authoritative copy before any host page is discarded.
++4. Discard only whole pages wholly covered by GPU-duplicate blobs. Pages shared with CPU-only blobs or malloc
++   boundaries are retained. The allocation and offsets stay intact; no backing file or model read is involved.
++5. Before processing the next command, check ownership against the same live table and copy those exact
++   bytes back from VRAM. Failure prevents inference from
++   continuing with a partial restore. Missing host bytes are never exposed as valid weights even during idle.
++
++HIP transfers use the cache's existing single-expert pinned bounce buffer in both directions, rather than
++registering a multi-GiB pageable allocation with the driver. Decode itself uses the existing resident weights,
++cache size, kernels and sampling. The extra copies happen at the request boundary, not inside token decoding.
++They can add request-boundary latency; that cost is reported rather than assumed to be zero.
++
++Batch/pipelined execution, layer splits, async adaptation, pinned/rotated complements and Foresight are excluded
++from this reclaim path. They retain the previous behavior. A run with no duplicate host pages reports 0 MiB;
++this optimization cannot reclaim memory that is already unique. The freed amount must be read from your log.
++
++## 2. Release CPU vision compute workspace before engine prefill
++
++The CPU vision context's GGML scheduler retained its compute buffers after image encoding. They then coexisted
++with engine prefill, resident experts and the application's allocations.
++
++The new `vision.release_workspace: true` option passes `--release-workspace`. After writing an image's exact
++embeddings, the encoder frees preprocessing objects, synchronizes and releases only its CPU graph scheduler's
++compute buffers, and trims free libc pages on glibc Linux. Encoder/projector weights remain loaded at the same
++addresses. Attention selection, model parameters, image tokens and threads are retained. The next uncached
++image reserves workspace again; cached images still reuse the existing embedding files.
++
++The encoder acknowledges completion only after cleanup, so engine restoration/prefill cannot overlap with the
++old CPU workspace. The measured encode duration includes cleanup. This API extension is in the bundled mtmd
++sources; no external llama.cpp checkout is fetched by the rebuild script.
++
++## 3. Reuse the checkpoint being evicted before capturing its replacement
++
++The ordinary full LRU cache previously captured an additional complete GDN checkpoint and then evicted an old
++one. The memory profile selects the same old victim first and reuses its state-vector allocations for capture.
++The resulting cache entries, their order, stamps and configured count are unchanged. Pins, tail/spread policy,
++pooled checkpoints and layer splits keep the existing path. A failed capture does not publish a partial state;
++the discarded entry was a cache entry, and live model state is unaffected.
++
++## Validation actually performed here
++
++The following are memory/correctness checks, not an AMD model-speed claim:
++
++- A real anonymous-memory test used a 192 MiB host arena with a 96 MiB simulated-VRAM duplicate region. Idle
++  reclaim reduced process RSS by 95.9 MiB. Every CPU-only byte stayed intact, and the complete arena matched
++  byte-for-byte after restore. Misalignment, neighboring CPU pages, bad ranges and partial-copy failure/retry
++  are tested. The source of restored bytes in that test is simulated VRAM, not an actual PCIe device.
++- The added ownership regression test reproduces the earlier wrong-expert restore after an adaptive swap.
++  It then exercises the actual corrected planner with 769 swaps and 256 reclaim/restore rounds, verifying
++  every RAM expert against its original bytes and protecting every CPU-only expert during idle. GPU slots
++  are represented by host buffers in this test. See `REPETITION_FIX.md` for its results and limits.
++- The actual modified CLIP workspace function was compiled and exercised with real GGML CPU graphs. Across
++  three release/rebuild rounds it freed 134,217,728 bytes each time, retained the persistent weight buffer at
++  the same address, and reproduced output hash `842a591a98222325`. RSS fell from about 133 MiB to 5-9 MiB after
++  each release. This tests scheduler/buffer lifecycle with synthetic graph data, not a full Qwen projector.
++- The modified CPU `strata-vision` executable and mtmd library were fully built. The encoder's help command
++  runs, and the public mtmd header passes C compilation.
++- All 3,200 tested ordinary checkpoint-eviction decisions match the prior append-then-evict policy. Special
++  policies decline early reuse.
++- See `MEMORY_FIX_TEST_RESULTS.txt` for server, CTest, installer and syntax results. The model/GPU-dependent
++  parts have host syntax checks with real CUDA headers, not a full HIP or CUDA engine build.
++
++No AMD GPU, ROCm compiler or target model weights are available here. Therefore target peak RAM, image
++accuracy and 25 tok/s decode have not been measured for this revision. These changes remove specific wasted
++allocations; they do not establish that every workload fits in 32 GiB or cure arbitrary GPU memory spill.
++
++## What to inspect on the target PC
++
++The active log is `/mnt/ssd/Strata/strata-coder-uncen-iq1_m.log`. The new log lines report actual amounts:
++
++- `idle GPU shadows: released ... MiB` while waiting for a command;
++- `idle GPU shadows: live ownership v2` confirms the ownership correction is active;
++- `idle GPU shadows: restored ... MiB from VRAM in ... ms` before processing the next command;
++- `strata-vision: released ... MiB of CPU workspace; model weights retained` after a new image;
++- the existing runtime-memory JSON counters for RAM, swap, disk reads and AMD VRAM/GTT usage.
++
++Use the same image, prompt and inference settings for comparison. The relevant result is peak RAM during the
++same failing image request and sustained decode rate afterward, together with the actual released MiB and
++restore time. The older attached `strata-coder-iq1_m.log` is a different, earlier Coder run.
++
++The 26 October Uncen log's earlier reported 894/3676/4844 MiB releases are not valid savings measurements:
++the old planner could include CPU-only experts in those figures. Correct reclaim may be much smaller or
++zero, especially when the RAM complement and GPU cache contain disjoint experts. CPU-only weights must
++remain resident. The ownership correction does not establish that the original memory-pressure problem
++has been solved for this PC.
++
++Rollback uses the binary/config backups printed by the installer. The earlier experimental SSD expert patch
++is not used. Do not apply it to this source. The new memory modes are opt-in and can be disabled by clearing
++`STRATA_MEMORY_LIFECYCLE` and removing `vision.release_workspace` from a backed-up config.
+--- /dev/null
++++ b/docs/MEMORY_FIX_TEST_RESULTS.txt
+@@ -0,0 +1,67 @@
++Ownership correction — 26 October 2026
++
++Cause reproduced: the old idle path used ExpertCache::slot_of(), which retains
++the startup profile after adaptive swaps. The fixture performs a real reclaim
++and restore with that stale table and observes expert 0 overwritten by expert 3.
++The corrected path requires the live serve host_res table at release and restore.
++
++New regression (actual production planner, GPU slots simulated in host memory):
++idle GPU ownership: 14602 checks passed; reproduced old wrong-expert restore;
++769 adaptive swaps, 256 exact reclaim/restore rounds.
++AddressSanitizer + UndefinedBehaviorSanitizer: passed. Leak scanning disabled
++because the host tracing environment prevents LeakSanitizer thread scanning.
++CTest: idle_gpu_ownership_test, idle_gpu_shadows_test, vision_records_test,
++conversation_memory_test, session_save_reclaim_test: 5/5 passed (0.52 seconds).
++Installer/profile tests: 11 passed (0.173 seconds); includes rejection of the
++earlier unsafe memory engine, engine-only rebuild, failed-build protection,
++backup retention and byte-identical preservation of current vision/config.
++generate.cpp + expert_source.cpp: C++20 host syntax checks passed with CUDA 12.9
++headers, zero diagnostics. Shell syntax and whitespace checks passed.
++
++The old multi-GiB target reclaim counts are not reliable savings measurements:
++CPU-only weights could be misclassified. Correct release may be smaller or zero.
++No target AMD full-model reproduction or HIP/CUDA engine build was possible here.
++The original memory-pressure problem is not proven solved by this correction.
++
++Earlier lifecycle validation (server/vision unchanged in this correction)
++---------------------------------------------------------------------
++The earlier fixed-ownership RAM fixture below did not exercise adaptive swaps
++and therefore missed the ownership bug. The new regression above covers it.
++
++Fully built here: modified CPU strata-vision, mtmd and GGML dependencies.
++Actual GGML CPU workspace test (persistent weights + scratch allocation lifecycle):
++clip_ctx: CLIP using CPU backend
++workspace round 0: freed=134217728 bytes RSS before=136200 KiB after=5156 KiB hash=842a591a98222325
++workspace round 1: freed=134217728 bytes RSS before=136252 KiB after=5628 KiB hash=842a591a98222325
++workspace round 2: freed=134217728 bytes RSS before=136740 KiB after=9344 KiB hash=842a591a98222325
++CPU workspace integration: passed
++
++Real anonymous-memory reclaim/restore fixture (VRAM source simulated in host memory):
++idle shadows: 22 checks passed; fixture RSS before=296588 KiB idle=198344 KiB reduction=95.9 MiB
++
++Selected server/API and installer suite:
++----------------------------------------------------------------------
++Ran 468 tests in 174.872s
++
++OK
++
++Focused installer/profile rerun after adding activation ordering: 7 tests passed.
++  Includes failed vision build leaving both prior binaries and config intact;
++  both binary installs preceding profile activation; existing args/image values preserved;
++  old encoder rejected; GPU vision not silently changed to CPU.
++CMake/CTest: idle_gpu_shadows_test, vision_records_test, conversation_memory_test,
++  session_save_reclaim_test: 4/4 passed.
++Vision CTest: cpu_workspace_test: 1/1 passed.
++Checkpoint retention: existing conv_cache_test passed, including 3,200 comparisons
++  of pre-capture recycling against the prior eviction policy.
++Host syntax: src/program/generate.cpp, src/core/expert_source.cpp,
++  src/core/expert_cache.cpp passed with real CUDA 12.9 headers.
++Public mtmd header: C11 syntax check passed.
++Shell/Python syntax and git diff whitespace checks passed.
++
++Limits: no actual AMD GPU, ROCm/HIP compiler, full CUDA compiler or target GGUF
++model weights are available here. No full HIP/CUDA engine build, full-model
++image-quality test, target peak-RAM test or 25 tok/s measurement was performed.
++The host-shadow fixture simulates the authoritative GPU bytes in host RAM.
++The CPU GGML test uses synthetic tensors, not the user's complete projector.
++Real released memory and boundary-copy times must be taken from target logs.
+--- /dev/null
++++ b/tests/core/idle_gpu_ownership_test.cpp
+@@ -0,0 +1,124 @@
++#include "strata/core/idle_gpu_shadows.hpp"
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <sys/mman.h>
++
++using namespace strata::core::detail;
++static int checks = 0;
++static void check(bool ok, const char* why) {
++    ++checks;
++    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", why); std::exit(1); }
++}
++
++int main() {
++    constexpr size_t layers = 3, per_layer = 8, per_gpu = 3, count = layers * per_layer;
++    constexpr uint64_t absent = ~uint64_t{0};
++    const std::vector<uint64_t> bytes{4096, 8192, 12288};
++    std::vector<uint64_t> offsets(count, absent);
++    std::vector<int32_t> live(count, -1);
++    std::vector<std::vector<uint8_t>> exact(count), gpu(layers * per_gpu);
++    size_t total = 0;
++    for (size_t l = 0; l < layers; ++l) {
++        for (size_t e = 0; e < per_layer; ++e) {
++            const size_t i = l * per_layer + e;
++            exact[i].resize(bytes[l]);
++            for (size_t p = 0; p < bytes[l]; ++p)
++                exact[i][p] = (uint8_t) (i * 31 + p * 13 + (p >> 8) * 7);
++            if (e < per_gpu) {
++                live[i] = (int32_t) (l * per_gpu + e);
++                gpu[(size_t) live[i]] = exact[i];
++            }
++            // One duplicate lend-region expert; all other RAM experts are CPU-only.
++            if (e >= per_gpu - 1) { offsets[i] = total; total += bytes[l]; }
++        }
++    }
++    const auto startup = live;   // ExpertCache::slot_of() keeps this table after swaps.
++    auto* host = (uint8_t*) mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    check(host != MAP_FAILED, "allocate real resident expert pages");
++    for (size_t i = 0; i < count; ++i)
++        if (offsets[i] != absent) std::memcpy(host + offsets[i], exact[i].data(), exact[i].size());
++
++    auto swap = [&](size_t incoming, size_t outgoing) {
++        const int32_t slot = live[outgoing];
++        check(slot >= 0 && live[incoming] < 0 && offsets[incoming] != absent, "adaptive swap has valid owners");
++        const auto in_bytes = std::vector<uint8_t>(host + offsets[incoming], host + offsets[incoming] + exact[incoming].size());
++        if (offsets[outgoing] == absent) {   // resident_stage_swaps + commit_exchanges
++            std::memcpy(host + offsets[incoming], gpu[(size_t) slot].data(), exact[outgoing].size());
++            offsets[outgoing] = offsets[incoming];
++            offsets[incoming] = absent;
++        }
++        gpu[(size_t) slot] = in_bytes;
++        live[outgoing] = -1;
++        live[incoming] = slot;
++    };
++    swap(3, 0);
++    std::string error;
++    std::vector<GpuShadowBlob> wrong, plan;
++    check(gpu_shadow_plan(offsets, bytes, per_layer, startup, gpu.size(), wrong, error), "reproduce old startup-table plan");
++    bool corrupt = false;
++    for (const auto& b : wrong) {
++        if (gpu[(size_t) b.slot] != exact[b.expert]) corrupt = true;
++    }
++    check(corrupt, "old table would restore a different expert into RAM after the first swap");
++    IdleGpuShadows old_shadows;
++    check(old_shadows.release(host, total, wrong, error) && old_shadows.restore(host, [&](const auto& b, auto* dst, auto&) {
++        std::memcpy(dst, gpu[(size_t) b.slot].data(), b.bytes);
++        return true;
++    }, error), "exercise the old reclaim and restore with the stale startup table");
++    check(std::memcmp(host + offsets[0], exact[0].data(), exact[0].size()) != 0,
++          "old path physically overwrites CPU-only expert 0 with expert 3");
++    for (size_t i = 0; i < count; ++i)
++        if (offsets[i] != absent) std::memcpy(host + offsets[i], exact[i].data(), exact[i].size());
++
++    std::mt19937 random(1729);
++    IdleGpuShadows shadows;
++    for (int round = 0; round < 256; ++round) {
++        for (size_t l = 0; l < layers; ++l) {
++            std::vector<size_t> cpu, cached;
++            for (size_t e = 0; e < per_layer; ++e) {
++                const size_t i = l * per_layer + e;
++                (live[i] < 0 ? cpu : cached).push_back(i);
++            }
++            swap(cpu[random() % cpu.size()], cached[random() % cached.size()]);
++        }
++        check(gpu_shadow_plan(offsets, bytes, per_layer, live, gpu.size(), plan, error), "plan from actual adaptive owners");
++        for (const auto& b : plan)
++            check(gpu_shadow_owner_matches(b, live) && gpu[(size_t) b.slot] == exact[b.expert], "every duplicate has its exact GPU weights");
++        check(shadows.release(host, total, plan, error) && shadows.released_bytes() > 0, "discard only real duplicate pages");
++        for (size_t i = 0; i < count; ++i) {
++            if (live[i] < 0) {
++                check(offsets[i] != absent && !shadows.missing(i), "CPU-only expert cannot be reclaimed");
++                check(std::memcmp(host + offsets[i], exact[i].data(), exact[i].size()) == 0, "CPU-only weights intact during idle");
++            }
++        }
++        // Same slot, wrong identity: reject before copying. Keep the lease missing.
++        if (round == 0) {
++            const auto b = plan.front();
++            auto changed = live;
++            changed[b.expert] = -1;
++            check(!gpu_shadow_owner_matches(b, changed), "restore detects an expert evicted during idle");
++        }
++        check(shadows.restore(host, [&](const auto& b, auto* dst, auto& why) {
++            if (!gpu_shadow_owner_matches(b, live)) { why = "ownership changed"; return false; }
++            std::memcpy(dst, gpu[(size_t) b.slot].data(), b.bytes);
++            return true;
++        }, error), "restore exact bytes using live slots");
++        for (size_t i = 0; i < count; ++i)
++            if (offsets[i] != absent)
++                check(std::memcmp(host + offsets[i], exact[i].data(), exact[i].size()) == 0, "all RAM experts exact after repeated adaptive exchanges");
++    }
++    auto invalid = live;
++    invalid.pop_back();
++    check(!gpu_shadow_plan(offsets, bytes, per_layer, invalid, gpu.size(), plan, error), "reject wrong live table size");
++    invalid = live;
++    invalid[0] = (int32_t) gpu.size();
++    check(!gpu_shadow_plan(offsets, bytes, per_layer, invalid, gpu.size(), plan, error), "reject out-of-range live slot");
++    invalid = live;
++    const auto owner = (size_t) (std::find_if(live.begin(), live.end(), [](auto s) { return s >= 0; }) - live.begin());
++    invalid[(owner + 1) % count] = live[owner];
++    check(!gpu_shadow_plan(offsets, bytes, per_layer, invalid, gpu.size(), plan, error), "reject duplicate live ownership");
++    std::printf("idle GPU ownership: %d checks passed; reproduced old wrong-expert restore; 769 adaptive swaps, 256 exact reclaim/restore rounds\n", checks);
++    munmap(host, total);
++}
+--- /dev/null
++++ b/tools/rebuild-ownership-fix.sh
+@@ -0,0 +1,41 @@
++#!/usr/bin/env bash
++# Incremental engine-only correction for the memory-lifecycle ownership bug.
++set -euo pipefail
++strata_root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
++strata_build="$strata_root/build-memory-fix-hip"
++strata_jobs="${STRATA_BUILD_JOBS:-2}"
++strata_arch="${STRATA_HIP_ARCH:-gfx1030}"
++if ! command -v cmake >/dev/null; then
++    printf '%s\n' 'Activate the existing Strata .venv (cmake is required), then retry.' >&2
++    exit 1
++fi
++if [[ ! -f "$strata_build/CMakeCache.txt" ]]; then
++    printf '%s\n' 'The previous memory-fix build is missing. Run tools/rebuild-memory-fix.sh for the initial build.' >&2
++    exit 1
++fi
++cmake -S "$strata_root" -B "$strata_build" \
++    -DCMAKE_BUILD_TYPE=Release \
++    -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF \
++    -DCMAKE_HIP_ARCHITECTURES="$strata_arch" \
++    -DSTRATA_PREFILL_MMQ=ON -DSTRATA_PORTABLE=OFF \
++    -DSTRATA_BUILD_TESTS=OFF -DSTRATA_BUILD_CONVERSATION_TESTS=OFF \
++    -DSTRATA_GGML_DIR="$strata_root/third_party/llama.cpp"
++cmake --build "$strata_build" --target strata -j "$strata_jobs"
++"$strata_build/strata" --help >/dev/null 2>&1
++if ! LC_ALL=C grep -aFq 'idle GPU shadows: live ownership v2' "$strata_build/strata"; then
++    printf '%s\n' 'The built engine lacks the ownership correction; the installed engine was not changed.' >&2
++    exit 1
++fi
++mkdir -p "$strata_root/engine"
++strata_new="$(mktemp "$strata_root/engine/.strata-ownership-new.XXXXXX")"
++trap 'rm -f -- "$strata_new"' EXIT
++cp -- "$strata_build/strata" "$strata_new"
++chmod 755 "$strata_new"
++if [[ -f "$strata_root/engine/strata" ]]; then
++    strata_backup="$(mktemp "$strata_root/engine/strata.pre-ownership-fix.XXXXXX")"
++    cp -p -- "$strata_root/engine/strata" "$strata_backup"
++    printf 'Previous engine saved as %s\n' "$strata_backup"
++fi
++mv -f -- "$strata_new" "$strata_root/engine/strata"
++printf '%s\n' 'Installed the live-ownership correction. Vision and configuration were preserved.' \
++    'Restart run-coder-uncen-iq1_m.sh and use New chat to discard the earlier corrupted conversation state.'
+--- /dev/null
++++ b/tools/test_rebuild_ownership_fix.py
+@@ -0,0 +1,64 @@
++"""Engine-only install must preserve the current config and vision binary."""
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++
++class OwnershipRebuild(unittest.TestCase):
++    def run_case(self, fail=False, stale=False):
++        with tempfile.TemporaryDirectory() as d:
++            root = Path(d) / "Strata project"
++            for p in ("tools", "engine", "build-memory-fix-hip", "bin"):
++                (root / p).mkdir(parents=True)
++            (root / "build-memory-fix-hip/CMakeCache.txt").touch()
++            script = Path(__file__).with_name("rebuild-ownership-fix.sh")
++            shutil.copyfile(script, root / "tools" / script.name)
++            engine = root / "engine/strata"
++            engine.write_bytes(b"previous engine")
++            vision = root / "engine/strata-vision"
++            vision.write_bytes(b"previous vision")
++            config = root / "strata-coder-uncen-iq1_m.json"
++            config.write_bytes(b'{"config":"preserve exact bytes"}\n')
++            cmake = root / "bin/cmake"
++            cmake.write_text('''#!/bin/bash
++set -eu
++if [[ "$1" == "--build" ]]; then
++    [[ "${TEST_FAIL:-0}" == "0" ]] || exit 42
++    printf '#!/bin/sh\\n# %s\\nexit 0\\n' "${TEST_MARKER}" > "$2/strata"
++    chmod +x "$2/strata"
++fi
++''')
++            cmake.chmod(0o755)
++            env = {**os.environ, "PATH": str(root / "bin") + os.pathsep + os.environ["PATH"],
++                   "TEST_FAIL": "1" if fail else "0",
++                   "TEST_MARKER": "old marker" if stale else "idle GPU shadows: live ownership v2"}
++            p = subprocess.run(["bash", str(root / "tools" / script.name)], env=env, capture_output=True, text=True)
++            backups = list((root / "engine").glob("strata.pre-ownership-fix.*"))
++            self.assertEqual(vision.read_bytes(), b"previous vision")
++            self.assertEqual(config.read_bytes(), b'{"config":"preserve exact bytes"}\n')
++            self.assertEqual(list((root / "engine").glob(".strata-ownership-new.*")), [])
++            if fail or stale:
++                self.assertNotEqual(p.returncode, 0, p.stderr)
++                self.assertEqual(engine.read_bytes(), b"previous engine")
++                self.assertEqual(backups, [])
++            else:
++                self.assertEqual(p.returncode, 0, p.stderr)
++                self.assertIn(b"live ownership v2", engine.read_bytes())
++                self.assertEqual(len(backups), 1)
++                self.assertEqual(backups[0].read_bytes(), b"previous engine")
++
++    def test_installs_only_engine(self):
++        self.run_case()
++
++    def test_build_failure_preserves_engine(self):
++        self.run_case(fail=True)
++
++    def test_rejects_uncorrected_binary(self):
++        self.run_case(stale=True)
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- /dev/null
++++ b/docs/REPETITION_FIX.md
+@@ -0,0 +1,71 @@
++# Repetition caused by stale expert ownership
++
++## Fault found
++
++The 26 October Coder Uncen log shows 462 adaptive exchanges before the first idle release, 5,176 before
++the second, and a 3,675.8 MiB restore before the request that repeats `proc/PID?` in the screenshot.
++That run generated 4,245 tokens at 22.5 tok/s before cancellation. It does not establish a bad GGUF.
++
++The memory-lifecycle code introduced a concrete wrong-weight restore:
++
++1. Expert A initially occupies slot 0; Expert B is in RAM.
++2. Adaptive swapping puts B in slot 0 and copies A into B's former RAM location. Serve updates `host_res`.
++3. `ExpertCache::slot_of(A)` still returns slot 0: it is the startup profile, not the live adaptive table.
++4. The old idle planner wrongly discards A's CPU-only RAM weights. On the next request it copies B from
++   slot 0 into A's RAM location. Subsequent requests then compute with the wrong expert weights.
++
++The previous tests covered page boundaries and copies with fixed ownership; they missed adaptive swaps.
++The attached log does not contain token-level traces proving when the first divergent logit appeared,
++but the wrong-weight bug is directly reproducible in the old algorithm.
++
++## Correction
++
++Release and restore now require the live `host_res` table as an explicit argument. The planner checks table
++shape, live slot bounds and unique ownership. Only genuine GPU duplicates are eligible. Restore checks
++the saved expert/slot identity against live ownership before copying. Existing synchronization, startup
++scratch refresh and fail-closed handling remain. The startup cache lookup is no longer consulted by
++either operation. No change is made to sampling, model quantization, context, speculative decoding or kernels.
++
++The profile configurator rejects the earlier memory engine even though it supports `STRATA_MEMORY_LIFECYCLE`.
++It now requires the corrected `idle GPU shadows: live ownership v2` marker.
++
++The earlier reported multi-GiB release amounts may include CPU-only weights and must not be treated as safe
++memory savings. Correct release may report 0 MiB. The original memory-pressure problem still needs target
++hardware validation; this revision corrects the introduced data corruption.
++
++## Install over the memory-lifecycle revision
++
++Stop the server. Extract `Strata-repetition-fix.zip` into `/mnt/ssd`, overwriting its `Strata/` source files.
++Then run:
++
++```bash
++cd /mnt/ssd/Strata
++source .venv/bin/activate
++bash tools/rebuild-ownership-fix.sh
++bash run-coder-uncen-iq1_m.sh
++```
++
++The script uses the existing `build-memory-fix-hip` directory and rebuilds only the engine. It retains
++gfx1030, native CPU and MMQ settings, checks the new executable, backs up the installed engine and installs
++the replacement. The vision encoder and current JSON configuration are preserved. If that build directory
++is missing, it directs you to the initial `rebuild-memory-fix.sh` script.
++
++After restart, check the log for `idle GPU shadows: live ownership v2`. Use **New chat**: the old process's
++weights/checkpoints and the earlier repeated conversation must not be reused. The fix does not modify
++GGUF files, so this failure does not require downloading the model again.
++
++## Validation
++
++- The regression fixture physically reproduces the old corruption: expert 0's RAM is overwritten with
++  expert 3's GPU-slot bytes after the first swap.
++- The corrected production planner completes 769 adaptive swaps and 256 real anonymous-page reclaim/restore
++  rounds with all RAM experts matching their original bytes, including CPU-only experts during idle.
++- Invalid table shape, duplicate live slots, out-of-range slots and ownership changes are rejected.
++- AddressSanitizer/UndefinedBehaviorSanitizer checks pass with leak scanning disabled because the host's
++  tracing environment prevents LeakSanitizer from scanning `/proc` threads.
++- CTest and the installer/configuration tests are recorded in `MEMORY_FIX_TEST_RESULTS.txt`.
++- The modified `generate.cpp` and `expert_source.cpp` pass C++20 host syntax checks with real CUDA headers.
++
++No AMD GPU, ROCm compiler or target model is available in this workspace. The target HIP engine and
++full-model output have not been run here. The regression proves wrong-weight corruption and its ownership
++correction using host buffers to represent GPU slots; it is not an AMD inference or throughput benchmark.
