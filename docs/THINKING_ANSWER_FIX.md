@@ -69,7 +69,7 @@ Strata directory into /mnt/ssd/Strata. Then:
 ```bash
 cd /mnt/ssd/Strata
 python3 tools/enable_reasoning_answer_fix.py
-bash run-coder-uncen-iq1_m.sh
+python serve/server.py --engine strata --config strata-swift-abl-iq2_xs.json --port 8099
 ```
 
 The helper verifies that the matching server code is present, backs up

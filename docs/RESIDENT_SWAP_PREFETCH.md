@@ -48,8 +48,9 @@ Stop Strata, extract `Strata-swap-prefetch-fix.zip` into `/mnt/ssd`, overwriting
 ```bash
 cd /mnt/ssd/Strata
 source .venv/bin/activate
-bash tools/rebuild-swap-prefetch-fix.sh
-bash run-coder-uncen-iq1_m.sh
+bash tools/rebuild-hip.sh
+python3 tools/configure_swap_prefetch.py
+python serve/server.py --engine strata --config strata-swift-abl-iq2_xs.json --port 8099
 ```
 
 The script reuses the existing HIP build directory and builds only the engine. It verifies capability markers,
@@ -87,5 +88,4 @@ were not tested. HIP/CUDA engine builds are also unavailable here; host syntax c
 This corrects the missing resident-page read-ahead path. It does not establish zero swap, prevent arbitrary
 system memory pressure, restore 20 tok/s after every idle period, or explain the empty HTTP response by itself.
 Compare the same workload, idle interval and memory conditions, including the new counters and major faults.
-`RESIDENT_SWAP_PREFETCH.patch` is the delta over the prior long-context source; use the packaged sources and
-rebuild script rather than applying historical patches over them.
+The source changes are in commit 7306db6a; see `git show 7306db6a`.

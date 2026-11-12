@@ -36,7 +36,7 @@ def enable(path, *, source=None):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path,
-                        default=Path(__file__).resolve().parents[1] / 'strata-coder-uncen-iq1_m.json')
+                        default=Path(__file__).resolve().parents[1] / 'strata-swift-abl-iq2_xs.json')
     args = parser.parse_args()
     try:
         config, backup = enable(args.config)
@@ -44,4 +44,4 @@ if __name__ == '__main__':
         parser.exit(1, str(error) + '\n')
     print('Thinking-only completion recovery enabled (reasoning_close_retry v2).')
     print('Config backup:', backup)
-    print('Restart run-coder-uncen-iq1_m.sh to load the updated server.')
+    print('Restart the Strata server to load the updated config.')

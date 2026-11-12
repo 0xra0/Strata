@@ -213,19 +213,17 @@ cmake --build build-vision --target strata-vision -j$(nproc)
 To enable memory lifecycle, swap prefetch, and prompt streaming optimizations on an existing build:
 
 ```bash
-# 1. Build and configure memory lifecycle & CPU vision workspace release
-bash tools/rebuild-memory-fix.sh
+# 1. Build the engine (add --vision to rebuild the CPU vision encoder too).
+#    The old engine is kept as engine/strata.prev.
+bash tools/rebuild-hip.sh
 
-# 2. Add long-context dynamic working set & thinking auto-budget
-bash tools/rebuild-long-context-fix.sh
+# 2. Switch the features on in the run config (each makes a backup first)
+python3 tools/configure_memory_lifecycle.py
+python3 tools/configure_long_context.py
+python3 tools/configure_swap_prefetch.py
+python3 tools/configure_prompt_stream.py
 
-# 3. Add kernel swap prefetch lookahead
-bash tools/rebuild-swap-prefetch-fix.sh
-
-# 4. Add cache-avoidant prompt file stream reader
-bash tools/rebuild-prompt-stream-fix.sh
-
-# 5. Enable reasoning-only completion recovery in server configuration
+# 3. Enable reasoning-only completion recovery in server configuration
 python3 tools/enable_reasoning_answer_fix.py
 ```
 
@@ -367,8 +365,7 @@ python3 -m unittest tools/test_configure_memory_lifecycle.py \
                      tools/test_long_context_fix.py \
                      tools/test_prompt_stream_fix.py \
                      tools/test_reasoning_answer_fix.py \
-                     tools/test_rebuild_memory_fix.py \
-                     tools/test_rebuild_ownership_fix.py \
+                     tools/test_rebuild_hip.py \
                      tools/test_swap_prefetch_fix.py
 ```
 

@@ -42,7 +42,7 @@ def recover(config_path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--config", type=Path,
-                    default=Path(__file__).resolve().parents[1] / "strata-coder-uncen-iq1_m.json")
+                    default=Path(__file__).resolve().parents[1] / "strata-swift-abl-iq2_xs.json")
     args = ap.parse_args()
     try:
         cfg, backup = recover(args.config)
@@ -52,7 +52,7 @@ def main():
     print("Inference arguments and all vision settings preserved.")
     print("Config backup:", backup)
     print("Active engine log:", cfg.get("log", "(no log configured)"))
-    print("Stop the current Strata server, then start your usual run-coder-uncen-iq1_m.sh launcher.")
+    print("Stop the current Strata server, then start it again.")
 
 
 if __name__ == "__main__":

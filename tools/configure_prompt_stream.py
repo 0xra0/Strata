@@ -41,7 +41,7 @@ def configure(path):
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--config', type=Path, default=Path(__file__).resolve().parents[1] / 'strata-coder-uncen-iq1_m.json')
+    p.add_argument('--config', type=Path, default=Path(__file__).resolve().parents[1] / 'strata-swift-abl-iq2_xs.json')
     args = p.parse_args()
     try:
         config, backup = configure(args.config)

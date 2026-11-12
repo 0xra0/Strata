@@ -22,8 +22,8 @@ Then run:
 ```bash
 cd /mnt/ssd/Strata
 source .venv/bin/activate
-bash tools/rebuild-memory-fix.sh
-bash run-coder-uncen-iq1_m.sh
+bash tools/rebuild-hip.sh --vision
+python serve/server.py --engine strata --config strata-swift-abl-iq2_xs.json --port 8099
 ```
 
 **Both the engine and vision encoder must be rebuilt.** The script builds both before installing either,

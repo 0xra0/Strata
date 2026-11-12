@@ -41,14 +41,13 @@ Then run:
 ```bash
 cd /mnt/ssd/Strata
 source .venv/bin/activate
-bash tools/rebuild-ownership-fix.sh
-bash run-coder-uncen-iq1_m.sh
+bash tools/rebuild-hip.sh
+python serve/server.py --engine strata --config strata-swift-abl-iq2_xs.json --port 8099
 ```
 
-The script uses the existing `build-memory-fix-hip` directory and rebuilds only the engine. It retains
-gfx1030, native CPU and MMQ settings, checks the new executable, backs up the installed engine and installs
-the replacement. The vision encoder and current JSON configuration are preserved. If that build directory
-is missing, it directs you to the initial `rebuild-memory-fix.sh` script.
+The script builds the engine in `build-memory-fix-hip` (gfx1030, native CPU, MMQ), checks the new executable
+for every feature marker, keeps the installed engine as `engine/strata.prev` and installs the replacement.
+The vision encoder and JSON configuration are not touched.
 
 After restart, check the log for `idle GPU shadows: live ownership v2`. Use **New chat**: the old process's
 weights/checkpoints and the earlier repeated conversation must not be reused. The fix does not modify

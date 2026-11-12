@@ -68,14 +68,15 @@ Stop Strata. Extract `Strata-long-context-fix.zip` into `/mnt/ssd`, overwriting 
 ```bash
 cd /mnt/ssd/Strata
 source .venv/bin/activate
-bash tools/rebuild-long-context-fix.sh
-bash run-coder-uncen-iq1_m.sh
+bash tools/rebuild-hip.sh
+python3 tools/configure_long_context.py
+python serve/server.py --engine strata --config strata-swift-abl-iq2_xs.json --port 8099
 ```
 
 The script reuses `build-memory-fix-hip` and builds only the engine, preserving the gfx1030/native/MMQ build
 choices. It checks both ownership and working-set capability markers before replacing the installed engine,
-backs up the engine and config, then enables the new policies. The vision encoder is not rebuilt. If the
-previous build directory is missing, run the initial `tools/rebuild-memory-fix.sh` first.
+and keeps the old engine as `engine/strata.prev`. `configure_long_context.py` then backs up the config and
+enables the new policies. The vision encoder is not rebuilt.
 
 The config's engine arguments, model paths, VRAM reserve, RAM headroom and image settings are preserved.
 Existing explicit reasoning settings are also preserved and can override the new default. Source-archive
@@ -85,9 +86,7 @@ On restart, the log should retain `idle GPU shadows: live ownership v2`. For a t
 own budget, it should show `default thinking allowance: 4096 tokens` (or the effort-specific value). After
 generation, look for `RAM working set v1: active`, promotion counts and `strata decode timing`.
 
-`docs/LONG_CONTEXT.patch` is the delta from the corrected ownership archive. `MEMORY_FIX.patch` records the
-earlier memory/ownership changes. Use the packaged source and rebuild script rather than applying historical
-patches over it.
+The source changes are in commit 7306db6a; see `git show 7306db6a`.
 
 ## Validation and limits
 

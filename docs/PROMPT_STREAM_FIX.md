@@ -85,8 +85,9 @@ Strata directory with /mnt/ssd/Strata. Then run:
 ```bash
 cd /mnt/ssd/Strata
 source .venv/bin/activate
-bash tools/rebuild-prompt-stream-fix.sh
-bash run-coder-uncen-iq1_m.sh
+bash tools/rebuild-hip.sh
+python3 tools/configure_prompt_stream.py
+python serve/server.py --engine strata --config strata-swift-abl-iq2_xs.json --port 8099
 ```
 
 The script incrementally rebuilds only the engine in build-memory-fix-hip,

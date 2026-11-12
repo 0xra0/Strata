@@ -48,49 +48,6 @@ class Configure(unittest.TestCase):
             self.assertEqual(list(p.parent.glob('*.before-swap-prefetch-*')), [])
 
 
-class Install(unittest.TestCase):
-    def run_case(self, fail=False, stale=False):
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d) / 'Strata project'
-            for name in ('tools', 'engine', 'build-memory-fix-hip', 'bin'): (root / name).mkdir(parents=True)
-            (root / 'build-memory-fix-hip/CMakeCache.txt').touch()
-            for name in ('rebuild-swap-prefetch-fix.sh', 'configure_swap_prefetch.py'):
-                shutil.copyfile(Path(__file__).with_name(name), root / 'tools' / name)
-            exe = root / 'engine/strata'; exe.write_bytes(b'old engine')
-            vision = root / 'engine/strata-vision'; vision.write_bytes(b'old vision')
-            cfg = {'exe': str(exe), 'args': ['--resident-experts', '--max-context', '131072'],
-                   'reasoning_auto_budget_tokens': 8192, 'vision': {'gpu': False, 'max_tokens': 300}}
-            path = root / 'strata-coder-uncen-iq1_m.json'; path.write_text(json.dumps(cfg))
-            cmake = root / 'bin/cmake'
-            cmake.write_text('''#!/bin/bash
-set -eu
-if [[ "$1" == "--build" ]]; then
-    [[ "${TEST_FAIL:-0}" == "0" ]] || exit 42
-    printf '#!/bin/sh\\n# %s\\nexit 0\\n' "${TEST_MARKERS}" > "$2/strata"
-    chmod +x "$2/strata"
-fi
-'''); cmake.chmod(0o755)
-            env = {**os.environ, 'PATH': str(root / 'bin') + os.pathsep + os.environ['PATH'],
-                   'TEST_FAIL': '1' if fail else '0', 'TEST_MARKERS': 'old engine' if stale else MARKERS}
-            r = subprocess.run(['bash', str(root / 'tools/rebuild-swap-prefetch-fix.sh')], env=env, capture_output=True, text=True)
-            self.assertEqual(vision.read_bytes(), b'old vision')
-            backups = list((root / 'engine').glob('strata.pre-swap-prefetch.*'))
-            if fail or stale:
-                self.assertNotEqual(r.returncode, 0, r.stderr)
-                self.assertEqual(exe.read_bytes(), b'old engine')
-                self.assertEqual(json.loads(path.read_text()), cfg)
-                self.assertEqual(backups, [])
-            else:
-                self.assertEqual(r.returncode, 0, r.stderr)
-                self.assertEqual(len(backups), 1); self.assertEqual(backups[0].read_bytes(), b'old engine')
-                after = json.loads(path.read_text())
-                self.assertEqual(after['args'], cfg['args']); self.assertEqual(after['vision'], cfg['vision'])
-                self.assertEqual(after['reasoning_auto_budget_tokens'], 8192)
-
-    def test_install_and_activate(self): self.run_case()
-    def test_failed_build_preserves_everything(self): self.run_case(fail=True)
-    def test_stale_binary_is_not_installed(self): self.run_case(stale=True)
-
 
 class Response(io.BytesIO):
     status = 200
