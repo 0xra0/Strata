@@ -1,31 +1,372 @@
-# Which model? Sizes, versions and what fits
+﻿# Which model? Sizes, versions and what fits
 
-Strata runs one model, [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), in several **sizes**
-(the same model, compressed more or less) and several **versions** (the original, a coding version, a fine-tune).
-The installer recommends one for your PC; this page explains the choice. Back to the [README](../README.md).
+This page helps you choose a model and check that your computer can run it. It covers
+Qwen3.8-Flash-Next (and its variants), Qwen3.6-35B-A3B, Tencent Hy4-Flash, and Inkling-2-Mini. For installing, see [INSTALL.md](INSTALL.md).
 
-> **On this page:** [Pick by RAM](#pick-by-ram) · [Speed](#how-fast-is-each-size) · [The sizes](#the-sizes) ·
-> [Will it fit?](#will-it-fit) · [The versions](#the-versions) · [Adding another model](#adding-or-switching-models)
+> **On this page:** [Quick start](#quick-start) · [Pick by memory](#pick-by-memory) ·
+> [Qwen3.8-Flash-Next](#qwen38-flash-next) ·
+> [Qwen3.6-35B-A3B](#qwen36-35b-a3b) ·
+> [Tencent Hy4-Flash](#tencent-hy4-flash) ·
+> [Inkling-2-Mini](#inkling-2-mini) · [Adding or switching models](#adding-or-switching-models) ·
+> [History](#history--older-measurements)
 
-## Pick by RAM
+## Quick start
 
-| Your RAM | Take | Why |
+1. Find your memory in [Pick by memory](#pick-by-memory) and choose the first provider that fits.
+2. Print the plan. Nothing is downloaded or changed:
+
+   ```sh
+   strata launch --plan --family qwen --model iq2_xs
+   ```
+
+3. Start it with `strata launch` (guided), or run the same command without `--plan` and add `--yes --no-tui`.
+
+**Provider order:** ISTA-DASLab, then Unsloth, then Gyro, then others, using the first compatible pack that fits the
+model and your hardware. ISTA-DASLab is the default recommendation. Gyro saves memory and is slower. Swift 1.5, NVFP4
+and OrcaRouter are other options. An explicit choice by the user always wins. The order applies within a model family:
+Qwen3.6 has Unsloth packs only. The order is a recommendation. It says nothing about which
+provider wins a given quality or speed comparison.
+
+Setup may preselect something else: a Swift or Gyro size at a low memory tier, or Unsloth on Strix Halo. Read the plan
+and pass `--family` and `--model` when you want a particular provider.
+
+## Pick by memory
+
+Figures are the model's weights in RAM plus VRAM. Leave memory for the OS and other apps. Unified memory counts once.
+They are estimates; a given context may still not fit.
+
+**Qwen3.8-Flash-Next, ISTA-DASLab original packs**
+
+| Size | RAM + VRAM for the model | Speed | Quality |
+| --- | ---: | --- | --- |
+| Q2_0 | 37.6 GB | fastest | good |
+| IQ2_XS | 39.2 GB | fast | better |
+| IQ3_XXS | 47.0 GB | slower | great |
+| IQ3_S | 54.8 GB | slowest | best; matches the full model on the published tests |
+
+- **Less memory, coding only:** [Coder](#coder) runs around 32 GB of RAM with a suitable GPU.
+- **Less memory, general use:** compare Unsloth, then [Gyro](#gyro-s-and-gyro-m-agentionai), which uses the least memory and is slower.
+- **More memory:** [Unsloth's 4 to 8 bit files](#unsloths-files-ud-iq4_xs-to-q8_0) need 72 to 136 GB for all experts in RAM.
+- **A smaller model:** [Qwen3.6-35B-A3B](#qwen36-35b-a3b) (32 to 52 GB of RAM) or [Inkling-2-Mini](#inkling-2-mini) (8 to 24 GB GPU / 16 to 32 GB RAM).
+- **Large native MoE:** [Tencent Hy4-Flash](#tencent-hy4-flash) (64 to 128 GB of RAM or unified memory, plus Engram shard on SSD).
+
+If RAM is short, setup can read experts from the SSD instead ([below](#will-it-fit)). That works and is much slower.
+
+<a id="the-versions"></a><a id="the-sizes"></a>
+
+## Qwen3.8-Flash-Next
+
+Four [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) sizes are the original model; the versions below are variants or other providers' packs of it.
+Every version in setup's menu reads pictures. [Picture rules](#pictures).
+
+### Will it fit?
+
+Shard 1 is loaded at start: its experts go into **RAM**, the rest onto the graphics card. The second shard (a 29 GB
+lookup table) stays on the SSD. The model fits when **RAM is at least the experts plus about 10 GB** for the OS and
+other programs.
+
+| Size | Experts in shard 1 |
+| --- | ---: |
+| Q2_0 | 34 GB |
+| IQ2_XS | 35.5 GB |
+| IQ3_XXS | 43 GB |
+| IQ3_S | 50 GB |
+| Coder | 23 GB |
+
+With 64 GB of RAM every size fits (IQ3_S with little else open). With 48 GB, Q2_0 and IQ2_XS fit. A bigger graphics
+card makes it faster and does not lower the RAM needed, except in low-RAM mode.
+
+<a id="a-big-graphics-card-and-little-ram"></a>
+
+**Big graphics card, little RAM.** When RAM cannot hold the experts beside the system, setup maps them from the model
+files and keeps in RAM only what the card does not hold. A 32 GB PC with a 24 GB GPU runs Q2_0, IQ2_XS and the Coder
+this way, and a 32 GB PC with a 12 to 16 GB GPU runs the Coder. With a small card most experts come from the SSD and it
+is much slower; setup says so. A source checkout can force the mode with `--low-ram on|off`
+([SOURCE_INSTALL.md](SOURCE_INSTALL.md)). `strata launch` has no `--low-ram` flag.
+
+The download is 66 to 76 GB for the three smaller sizes ([details](DETAILS.md#which-model)). The first start also
+fetches the MTP draft layer (about 6 GB, 1 GB more with pictures).
+
+### Pictures
+
+Pictures are on by default wherever a model can read them. The reader runs on the CPU when the card has less than
+24 GB (a few seconds per picture, no VRAM used) and on the card from 24 GB (about 1 to 1.4 GB of VRAM, 0.1 to 0.5 s per
+picture). The rule is the same on NVIDIA and AMD.
+
+| Setting | Effect |
+| --- | --- |
+| `--vision off` | no pictures (also "No" in the app and in `strata launch`) |
+| `--vision cpu` / `--vision gpu` | choose the reader |
+
+- **AMD:** `strata-vision-hip` is the card's reader. If it cannot start, Strata uses the CPU reader ([AMD_HIP.md](AMD_HIP.md)).
+- **Mac:** pictures run on the GPU ([MAC.md](MAC.md)).
+- **Intel Arc:** an Arc with 24 GB or more keeps the CPU reader unless you pass `--vision gpu`. A Battlemage card (B580, B70) has pictures off until you pass `--vision on` ([INTEL.md](INTEL.md)).
+
+More: [Images](DETAILS.md#images-vision).
+
+### Coder
+
+**[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)** is ISTA-DASLab's coding version.
+It keeps 256 of each layer's 512 experts, chosen on code (with agentic and image data), and drops the rest. Its authors
+report 91% of the full model's SWE-bench Verified score and 99% of LiveCodeBench. There is one size, IQ1_M (experts
+stored like IQ3_S); shard 1 is **29.6 GB**. A 32 GB RAM computer also needs enough GPU memory and room for buffers;
+read the launch plan.
+
+It is weaker outside code and in languages other than English, Chinese and other CJK text included. For general use,
+or whenever RAM allows, take a size that keeps every expert. More: [details](DETAILS.md#or-the-coder-half-the-experts-for-code).
+
+```sh
+strata launch --family coder --model IQ1_M
+```
+
+### Swift 1.5
+
+**[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)** is a fine-tune by UkisAI that
+thinks much shorter before answering, with about the same quality. Speed per token and RAM match the same size of the
+original. Its own license applies. More: [details](DETAILS.md#or-swift-15-a-fine-tune-that-thinks-shorter).
+
+```sh
+strata launch --family swift --model IQ2_XS
+```
+
+<a id="unsloth-ud-iq4_xs"></a><a id="unsloth-ud-q4_k_xl-experimental"></a>
+
+### Unsloth's files: UD-IQ4_XS to Q8_0
+
+`--family unsloth` is [Unsloth's 4 to 8 bit quantizations](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) of the same model. They keep the experts at more bits than
+the sizes above, so they need more RAM. Setup keeps every expert in RAM when they fit with 16 GB to spare. With less RAM
+it keeps as many as fit and reads the rest from the SSD (much slower), and for the bigger files it asks first.
+
+| Size | Download | Experts | RAM for all experts | Same top token as Q8_0 |
+| --- | ---: | ---: | ---: | ---: |
+| **UD-IQ4_XS** (setup's first) | 94 GB | 55 GiB | ~72 GB | 88.9% |
+| **UD-Q4_K_XL** | 111 GB | 72 GiB | ~88 GB | 93.1% |
+| **UD-Q5_K_XL** | 158 GB | 92 GiB | ~108 GB | 94.6% |
+| **UD-Q6_K_XL** | 169 GB | 102 GiB | ~118 GB | 94.6% |
+| **Q8_0** | 188 GB | 120 GiB | ~136 GB | 100% (the reference) |
+
+For comparison, IQ3_S matches the top token of Q8_0 87.7% of the time. Quality numbers, the speed bound and
+NVIDIA, AMD and Intel details are in [QUANTS.md](QUANTS.md); the files are described in [UD-Q4_K_XL](UNSLOTH_Q4.md) and
+[UD-Q6_K_XL](UNSLOTH_Q6.md). Older AMD speeds are in [History](#history--older-measurements).
+
+```sh
+strata launch --family unsloth --model UD-Q5_K_XL
+```
+
+<a id="gyro"></a>
+
+### Gyro-S and Gyro-M (agentionai)
+
+`--family gyro` is [agentionai's Gyro quantization](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF): trellis-coded experts in a rotated basis. They are the smallest
+options and never setup's default. The download includes the 28 GB n-gram table. The memory figure is VRAM and RAM together.
+
+| Size | Download | Memory (VRAM + RAM) | In plain words |
+| --- | ---: | ---: | --- |
+| **Gyro-S** | 58.5 GB | 27.6 GB | the smallest option, for PCs with little memory; lower quality |
+| **Gyro-M** | 92.0 GB | 35 GB | about IQ3_XXS quality with about 20% less GPU memory |
+
+The **fits** label compares the model files (excluding the n-gram table) with
+the available RAM and VRAM together. Setup makes a separate decision about
+keeping experts in memory. It can select low-RAM mode when system RAM cannot
+hold the experts with about 10 GiB left for the OS and other buffers. In that
+mode, Strata keeps experts in RAM only if the experts outside the GPU cache
+still fit with that headroom. Otherwise it reads them through the OS file cache,
+which can mean repeated SSD reads. A model can show **fits** and still stream
+experts from disk.
+
+Gyro runs on NVIDIA and AMD (experimental), on Intel Arc under Linux, and on Apple Silicon Macs. It reads pictures.
+On an RTX 3060 12 GB and an R9700, Gyro-M decodes 16 to 21% slower than Q2_0. Details, measurements and credit:
+[GYRO.md](GYRO.md). Intel Arc: [INTEL_ARC.md](INTEL_ARC.md). Mac: [MAC.md](MAC.md#gyro-s-and-gyro-m-agentionais-trellis-experts).
+
+```sh
+strata launch --family gyro --model Gyro-S
+```
+
+<a id="nvfp4"></a><a id="nvfp4-qad"></a>
+
+### NVFP4 (NVIDIA cards)
+
+`--family nvfp4` keeps the experts in NVIDIA's 4-bit NVFP4 format. There are three versions:
+
+| App name | `--model` | What it is | Download |
+| --- | --- | --- | ---: |
+| **NVFP4 (Strata's version)** | `NVFP4` | Strata's own conversion (GPTQ; the ready pack is sergqwer's strata-nvfp4). Best quality of the three | 128 GB |
+| **NVFP4 (NVIDIA's version)** | `NVFP4-NVIDIA` | NVIDIA's own checkpoint (plain rounding), converted for Strata. Same size and speed as the first | 128 GB |
+| **NVFP4 (NVIDIA, trained for FP4)** | `NVFP4-QAD` | NVIDIA's retrained model, slightly faster on short prompts | 102 GB (+110 GB of disk to prepare) |
+
+All three need about 80 GB of RAM to keep every expert in RAM, run on NVIDIA cards only and read pictures. RTX 50 cards
+have FP4 tensor cores; other NVIDIA cards run NVFP4 at 8-bit precision. Details and measurements: [NVFP4.md](NVFP4.md).
+
+**NVFP4-QAD** is NVIDIA's [Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local),
+retrained for 4-bit experts (quantization-aware distillation). Setup downloads NVIDIA's files as they are (102 GB) and
+turns them into a Strata pack on your PC once (20 to 40 minutes, about 110 GB more disk while it runs; the 102 GB can be
+deleted afterwards). Strata does not redistribute NVIDIA's weights. Pictures use the original model's reader file, which
+setup downloads with it. Licenses: NVIDIA Open Model Agreement and Qwen's Community License.
+More: [NVFP4.md](NVFP4.md#nvidias-fp4-local-checkpoint).
+
+```sh
+strata launch --family nvfp4 --model NVFP4
+```
+
+### OrcaRouter Uncensored IQ3_XXS
+
+For **OrcaRouter's Flash-Next Uncensored IQ3_XXS**, see the [manual compatibility setup](ORCA.md). It needs an explicit
+packing conversion and is not an installer menu option.
+
+## Qwen3.6-35B-A3B
+
+A smaller model from the same maker: [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) (35 billion
+parameters, 3 billion active per token, 256 experts, Apache 2.0). Strata runs
+[Unsloth's GGUFs with the MTP draft layer](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) on its own engine
+path, chosen by the file. It is in the app's model list and in setup (`--family qwen36`). It runs on NVIDIA and AMD
+cards; the Intel Arc engine and the Mac engine do not run it. It reads pictures and serves several requests at once.
+
+| Size | File | RAM setup plans for | In plain words |
+| --- | ---: | ---: | --- |
+| **UD-Q4_K_XL** | 22.9 GB | 32 GB | 4-bit (Unsloth Dynamic), the smallest; see the note below |
+| **UD-Q6_K_XL** | 32.6 GB | 44 GB | 6-bit, closer to the full model |
+| **Q8_0** | 37.8 GB | 52 GB | 8-bit, the closest to the full model |
+
+The picture reader file adds 0.9 GB. The engine keeps every expert it can on the graphics card and computes the rest on
+the CPU. The "RAM setup plans for" figures are planning sizes for system RAM. They are not a promise that every machine
+with that much RAM runs the size comfortably. On a card that cannot hold most experts (for example 12 GB or 16 GB of
+graphics memory), a large host expert arena stays in system RAM. Free physical RAM after the OS and other programmes
+must cover that arena; if it does not, start can fail after the process has opened with `no host memory for the experts`.
+The decode table below was measured on a Radeon AI PRO R9700 with 32 GB of graphics memory, and on an RTX 3060 with
+12 GB and most experts on the CPU. Those rows are decode speed only. They do not measure how long start takes, and they
+do not describe a 16 GB card sharing 32 GB of system RAM with other large processes.
+
+**Measured on:** UD-Q4_K_XL, decode only.
+
+| Hardware | Decode |
+| --- | ---: |
+| Radeon AI PRO R9700 (32 GB) | 117.8 tokens/s |
+| RTX 3060 (12 GB), most experts on the CPU | 59.7 tokens/s |
+
+Pictures, parallel requests, full measurements and limits: [QWEN36.md](QWEN36.md).
+
+```sh
+strata launch --family qwen36 --model UD-Q4_K_XL
+```
+
+## Tencent Hy4-Flash
+
+[Tencent Hy4-Flash](https://huggingface.co/tencent/Hy4-flash) runs on its dedicated Strata shape engine (`strata-hy4`) using
+[Strata's native `.strata` quantizations](https://huggingface.co/strata-engine/Hy4-Flash-Strata). It includes the built-in DFly2
+drafter, reads pictures (`Hy4-Flash-Vision.strata`, 0.93 GB), and streams its 67.6 GB Engram lookup shard (`Hy4-Flash-Engram-Q8.strata`)
+directly from the SSD.
+
+| Build | Model file | Engram shard (SSD) | Planning memory | In plain words |
+| --- | ---: | ---: | ---: | --- |
+| **SQ-64** | 62.0 GB | 67.6 GB | 64 GB RAM + 8+ GB GPU | flagship size; also supports 4-tier SSD cold-expert streaming on smaller RAM |
+| **SQ-96** | 89.6 GB | 67.6 GB | 96 GB RAM or 128 GB unified | higher precision, closer to the full model |
+| **SQ-128** | 113.7 GB | 67.6 GB | 128 GB RAM or 128 GB unified | highest precision native build |
+
+```sh
+strata launch --family hy4-flash --model SQ-64
+```
+
+## Inkling-2-Mini
+
+[Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) from Thinking Machines runs on its dedicated Strata shape
+engine (`strata-inkling`). Both [Strata's native `.strata` v1.1 builds](https://huggingface.co/strata-engine/Inkling-2-Mini-Strata)
+and [Unsloth's Dynamic GGUFs](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) are supported, with built-in DSpark speculative
+drafting and picture reading (`Inkling-2-Mini-Vision.strata`, 0.64 GB).
+
+**Strata native `.strata` builds**
+
+| Build | File size | Typical hardware | In plain words |
+| --- | ---: | --- | --- |
+| **SQ-10** | 10.5 GB | 12 GB GPU, 16 GB Mac, or 4–8 GB hybrid | compact high-speed build |
+| **SQ-15** | 14.3 GB | 16 GB GPU, 24 GB Mac, or 12 GB hybrid | flagship quality |
+| **SQ-20** | 19.3 GB | 24 GB GPU or 32+ GB unified | near-lossless native SF4+MX8 build |
+
+**Unsloth Dynamic GGUF builds** ([unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF), plus a 0.40 to 0.64 GB companion DSpark drafter)
+
+| Range | File sizes | Typical hardware |
+| --- | ---: | --- |
+| **UD-IQ1\_S / UD-IQ1\_M / UD-IQ2\_XXS / UD-Q2\_K\_XL** | 7.8 – 9.1 GB | 4–12 GB GPUs and 16 GB RAM |
+| **UD-IQ3\_XXS / UD-Q3\_K\_XL / UD-IQ4\_XS / UD-Q4\_K\_M / UD-Q4\_K\_XL** | 11.7 – 17.6 GB | 8–24 GB GPUs or hybrid RAM |
+| **UD-Q8\_K\_XL** | 22.9 GB | 24+ GB GPUs or 32+ GB RAM |
+
+```sh
+strata launch --family inkling-2-mini --model SQ-15
+```
+
+Inkling-2-Mini has its own engine package (`strata-inkling`), which Strata downloads the first time you choose the model. If you unpack a package by hand instead (for example after downloading it with a download manager), the right folder is `components\shapes\inkling2\engine\<package>\` (Windows: `%LOCALAPPDATA%\Strata\components\...`; Linux and Mac: `~/.local/share/strata/components/shapes/inkling2/engine/<package>/`), with `engine-component.json` directly inside the package folder; not in the Qwen engine's `engine` folder and not one folder deeper. When the install fails, the message now says why and names a wrongly placed package.
+
+**The DSpark drafter (speculative drafting)** is decided by a measurement on your computer: at the first start of a placement Strata runs a short speed test with and without it and keeps it on only where it is at least 10 percent faster on a mix of code and chat (`strata launch ... --drafting dspark` always turns it on, `--drafting off` always off).
+It is one small model: the original `mtp.safetensors` of Thinking Machines (636 MB, BF16; downloaded for the GGUF builds, pinned by commit and checksum), with Unsloth's 402 MB Q8_0 copy of the same weights (`dspark-...-Q8_0.gguf`, the version before 2026-11-23) as the fallback; the copy inside the SQ builds is the same checkpoint too. It guesses a few tokens ahead; the big model then checks them in one pass. Measured on RTX 3090 / A6000 / 5090 class cards with the whole model in VRAM:
+code, code edits, JSON, tool calls and repeated text come out 1.2x to 2.4x faster; chat and prose are 3 to 17 percent slower; summaries of long documents
+are about even. On cards that keep experts in RAM and decode slowly (about 8 tokens per second or less) it is 1.5x to 4x faster on everything. It needs
+a few hundred MB of video memory on a card that is already full (it takes a little expert space; up to 1 GB when the card has room), and its answers can differ from plain decoding after a few dozen tokens (the checking pass uses different arithmetic).
+
+**Sampling.** A request that names no sampling runs with temperature 1.0, the value in the model card's `generation_config.json`
+(no top_p, top_k or penalty is given there; the engine's own top_k 64 stays). Send `temperature` (or `"temperature": 0` for greedy)
+to choose another; the run config's `sampling` block and the Chat settings also win over the card. Before 0.2.22 such a request was greedy.
+
+### Inkling-2-Mini: thinking levels
+
+Inkling-2-Mini is trained with a **number** for how much it should think: the chat template writes `Thinking effort level: <n>` ahead of
+the conversation, `0` meaning no thinking. Strata sends the number the model was trained with and keeps names for convenience:
+
+| You send | Level written | Notes |
 | --- | --- | --- |
-| **32 GB** | **Coder** | it fits 32 GB; best at code, weaker at everything else ([why](#coder)). With a 24 GB card, Q2_0 and IQ2_XS run too ([low-RAM mode](#a-big-graphics-card-and-little-ram)) and are the better pick for general use |
-| **48 GB** | **IQ2_XS** (or Q2_0, the fastest) | the larger sizes do not fit |
-| **64 GB** | **IQ2_XS** (recommended), or IQ3_XXS / IQ3_S | every size fits (IQ3_S with little else open) |
-| **96 GB or more** | **IQ3_S**, or [Unsloth's UD-IQ4_XS or UD-Q4_K_XL](#unsloths-files-ud-iq4_xs-to-q8_0) (~4-bit) | room for the largest sizes |
-| **128-192 GB** | [Unsloth's UD-Q5_K_XL, UD-Q6_K_XL or Q8_0](#unsloths-files-ud-iq4_xs-to-q8_0) | every expert of the 5-8-bit files in RAM |
+| `"none"`, `"off"`, `0`, `"chat_template_kwargs": {"enable_thinking": false}`, Anthropic `"thinking": {"type": "disabled"}` | `0` | No thinking pass; the answer starts at once. |
+| `"minimal"` | `0.1` | |
+| `"low"` | `0.2` | **The default** when nothing names a level: a request's own level wins, then the level set in the Chat settings shared with other apps, then `reasoning_effort` in the run config (`none`, `low`, `medium` or `high`); only when none of them is set does `low` apply (`STRATA_INKLING_EFFORT` changes that last fallback). |
+| `"medium"` | `0.7` | Anthropic `budget_tokens` 2K to 8K. |
+| `"high"` | `0.9` | |
+| `"xhigh"`, `"max"` | `0.99` | |
+| a number from 0 to 0.99 (`"reasoning_effort": 0.5`) | that number | Passed to the template as it is; above 0.99 is 0.99. |
 
-Not sure? Take **IQ2_XS**. The **Coder** is the one that fits a 32 GB PC, but it keeps only 256 of the 512 experts,
-chosen on code data, so it is weaker outside code and in languages other than English. For general use, or whenever
-your RAM allows, take a full model (Q2_0, IQ2_XS or IQ3_S).
+A level above 0 lets the model write its thinking before the answer or a tool call. It comes back where each API puts thinking: chat
+completions `message.reasoning_content` (streamed as `delta.reasoning_content`), Anthropic messages a `thinking` content block, the
+Responses API a `reasoning` output item with `reasoning_text` content. The thinking tokens are counted in
+`usage.completion_tokens_details.reasoning_tokens` (Responses: `output_tokens_details.reasoning_tokens`).
 
-## How fast is each size
+**The thinking cannot run away.** A request's own `reasoning_budget_tokens` (or Anthropic `budget_tokens`) is the limit; without one
+the default of its level applies: 1,024 tokens at `none` and `minimal`, 2,048 at `low`, 4,096 at `medium`, 8,192 at `high`, 16,384 at
+`xhigh` and `max`. `STRATA_INKLING_THINKING_BUDGET=<tokens>` (config `inkling_thinking_budget`) sets one number for every level, `0`
+none; a request's `reasoning_budget_tokens: 0` turns the default off for that request. Claude Code's own default request
+(`thinking.budget_tokens` of exactly 31,999 on `/v1/messages`, level high) is held to the default of its level, 8,192 tokens, so a step
+does not think for minutes. Every other budget a client sends (any other `budget_tokens`, `reasoning_budget_tokens`, a budget with
+`reasoning_effort` and `max_completion_tokens`) is used as it is. `"inkling_budget_cap": false` in the run config (or
+`STRATA_INKLING_BUDGET_CAP=0`) lets Claude Code's default use the full 31,999 as well. When the budget is spent the server ends the
+thinking with a short wrap-up and the model answers. Whatever `max_tokens` is, a quarter of it (at least 512 tokens, but never more
+than half of it) stays for the answer. A reply that still ends with no text and no tool call is retried once with the answer
+opened, and if nothing visible can be produced the reply says so (`[No answer: ...]`) with `finish_reason` left as it was: never an
+empty string. See [DETAILS.md](DETAILS.md) for the settings.
 
-Measured on an RTX 5070 (12 GB), a Ryzen 5 7600 and 64 GB of RAM:
+## Adding or switching models
 
-| Size | Writes answers (short chat) | Writes answers (128K context) | Reads your prompt |
+- **In the app:** the Models page lists every model with its size and whether it fits your computer. Pick one and press the install button.
+- **In the Terminal:** `strata launch` has a Model step with the same list and "Use model files I already have".
+  `strata models list` shows what is installed. `strata models import <folder or .gguf> --plan` shows what a set of
+  files you already have would become, without changing anything.
+- **From a source checkout only:** `SETUP.bat` or `./setup.sh --setup` adds another model ([SOURCE_INSTALL.md](SOURCE_INSTALL.md)).
+
+Shared files are reused. In the Terminal, choose a model in `strata launch`, pass an explicit family and model, or use a
+saved `--preset`. Add `--restart` when replacing a running launch. Generated `run-<model>` scripts belong to a source
+checkout, not to the installed app.
+
+## Speed on your own PC
+
+`--tune quick` and `--tune thorough` measure settings for the selected model, and the app offers tuning too. Results
+depend on the backend and machine. All speed measurements, long-context numbers and estimates for other cards are in
+[DETAILS.md](DETAILS.md#speed-measured). AMD measurements per card are in [AMD_HIP.md](AMD_HIP.md#rdna4-gfx1201).
+Measured Strata on your own PC? See [Community benchmark results](COMMUNITY_BENCHMARKS.md).
+
+<a id="how-fast-is-each-size"></a>
+
+## History / older measurements
+
+These numbers compare the sizes with each other. Newer engines are faster on some cards, and the tables were not
+re-measured in full for the current release.
+
+**Measured on:** RTX 5070 (12 GB), Ryzen 5 7600, 64 GB RAM; ISTA-DASLab sizes; engine 0.1.26 (Q2_0 row: engine 0.1.36).
+
+| Size | Writes answers (short chat) | Writes answers (128K context) | Reads your prompt (32K) |
 | --- | ---: | ---: | ---: |
 | **Q2_0** | 94 tokens/s | 76 tokens/s | 2,650 tokens/s |
 | **IQ2_XS** | 79 tokens/s | 63 tokens/s | 2,090 tokens/s |
@@ -33,125 +374,25 @@ Measured on an RTX 5070 (12 GB), a Ryzen 5 7600 and 64 GB of RAM:
 | **IQ3_S** | 53 tokens/s | 46 tokens/s | 1,620 tokens/s |
 | **Coder** (IQ1_M) | 55 tokens/s | 43 tokens/s | 2,180 tokens/s |
 
-Measured on an AMD RX 9070 XT (16 GB), a Ryzen 9 3900X and 47 GB of RAM (Linux, setup's own install; Q2_0 is
-above setup's RAM estimate for 47 GB and was installed with `--model Q2_0 --yes`):
+**Measured on:** AMD RX 9070 XT (16 GB), Ryzen 9 3900X, 47 GB RAM, Linux; engine before 0.1.40, 2026-10-02. Q2_0 is
+above setup's RAM estimate for 47 GB and was installed with `--model Q2_0 --yes`.
 
-| Size | Writes answers (short chat) | Writes answers (128K context) | Reads your prompt |
+| Size | Writes answers (short chat) | Writes answers (128K context) | Reads your prompt (32K) |
 | --- | ---: | ---: | ---: |
 | **Q2_0** | 60 tokens/s | 48 tokens/s | 1,160 tokens/s |
 | **IQ2_XS** | 52 tokens/s | 36 tokens/s | 1,110 tokens/s |
 | **Coder** (IQ1_M) | 44 tokens/s | 33 tokens/s | 1,420 tokens/s |
 
-- **Writes answers** = how fast the reply appears (tokens per second; a token is about ¾ of a word).
-- **Reads your prompt** = how fast it takes in what you send (long documents, code, chat history), measured on a
-  32K-token prompt; a 4K prompt reads at 910-1,580 tokens/s. A 32K prompt takes about 15 seconds with Q2_0.
+- A token is about three quarters of a word. A 4K prompt reads at 910 to 1,580 tokens/s on the RTX 5070; a 32K prompt takes about 15 seconds with Q2_0.
+- The older NVIDIA `--calibrate` run on the RTX 5070 PC raised Coder speed by 7%.
 
-A card with more VRAM is faster, because more of the model fits on the GPU: an RTX 3090 (24 GB) should do roughly
-100-140 tokens per second. All measurements, long-context numbers and estimates for other cards are in the
-[details](DETAILS.md#speed-measured). The AMD measurements per card (RX 9070 XT, Radeon AI PRO R9700, RX 7800 XT,
-RX 9060 XT, RX 6900 XT) are in [AMD_HIP.md](AMD_HIP.md#rdna4-gfx1201).
+**Measured on:** AMD Radeon AI PRO R9700 (32 GB), Unsloth files, engines before 0.1.45.3 (conditions in [QUANTS.md](QUANTS.md)).
 
-Every PC is different: `START-HERE.bat --calibrate` measures a few engine settings on yours and keeps the fastest
-(about 15-30 minutes, longer on a slow card; on the PC above it made the Coder 7% faster; NVIDIA cards for now). Measured Strata on your own
-PC? See [Community benchmark results](COMMUNITY_BENCHMARKS.md) for a report template and how to share your results
-in a pull request.
+| Size | Story | Code | 32K prompt |
+| --- | ---: | ---: | ---: |
+| **UD-Q4_K_XL** | 63 tokens/s | 87 tokens/s | 1,110 to 1,320 tokens/s |
+| **UD-Q5_K_XL** | 57 to 60 | 82 | 810 to 1,260 |
+| **UD-Q6_K_XL** | 54 | 76 | 1,020 |
+| **Q8_0** | 53 to 57 | 66 to 74 | 1,230 to 1,300 |
+| *IQ3_S, same card* | 75 | 95 | - |
 
-## The sizes
-
-| Model | RAM+VRAM Requirements | Speed | Quality |
-| --- | ---: | --- | --- |
-| **Q2_0** | 37.6 GB | fastest | good |
-| **IQ2_XS** | 39.2 GB | fast | better (**recommended**) |
-| **IQ3_XXS** | 47.0 GB | slower | great |
-| **IQ3_S** | 54.8 GB | slowest | best: matches the full model on the published tests |
-
-The download is 66-76 GB for the three smaller sizes ([details](DETAILS.md#which-model)); the first start also
-fetches the MTP draft layer (~6 GB, +1 GB with images).
-
-## Will it fit?
-
-Shard 1 is the part of the model that gets loaded when it starts: its experts go into your **RAM**, the rest onto
-your graphics card (the second shard, a 29 GB lookup table, stays on the SSD). So it fits when your **RAM is at least
-the experts + about 10 GB** for Windows and your other programs - the experts are most of shard 1: 34 GB for Q2_0,
-35.5 for IQ2_XS, 43 for IQ3_XXS, 50 for IQ3_S, 23 for the Coder (the dense weights in shard 1 go to the graphics
-card). With 64 GB of RAM every size fits (IQ3_S with little else open); with 48 GB, Q2_0 and IQ2_XS. A bigger graphics card makes it faster, but it doesn't lower the RAM needed
-- except in the low-RAM mode below.
-
-### A big graphics card and little RAM
-
-On a PC whose RAM cannot hold the experts beside the system, setup maps them from the model's files instead and keeps
-in RAM only what the graphics card does not hold (the [low-RAM mode](DETAILS.md#speed-measured), chosen by setup). For
-example, a 32 GB PC with a 24 GB GPU runs Q2_0, IQ2_XS and the Coder this way, and a 32 GB PC with a 12-16 GB GPU the
-Coder. With a small card most experts then come from the SSD and it is much slower (setup says so).
-`START-HERE.bat --setup --low-ram on|off` overrides the choice.
-
-## The versions
-
-### Qwen3.8-Flash-Next
-
-The original, in all four sizes. With images, and with the
-[experimental speed projection](DETAILS.md#experimental-speed-projection-experimental-off-by-default) as an option.
-
-### Coder
-
-**[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)** - ISTA-DASLab's coding version:
-it keeps 256 of each layer's 512 experts, chosen on code (with agentic and image) data, and drops the rest (91% of
-the full model's SWE-bench Verified score, 99% of LiveCodeBench, by its authors). One size (IQ1_M: its experts stored
-like IQ3_S): shard 1 is **29.6 GB**, so it fits a PC with **32 GB of RAM**, runs 262K context on 64 GB, and reads long
-prompts the fastest of all. With half the experts gone it is weaker outside code and in languages other than
-English, Chinese and other CJK text included (#438: Chinese answers came out wrong or looping where English was
-fine). For general use, or whenever your RAM allows, take a size that keeps every expert: Q2_0, IQ2_XS or IQ3_S.
-More: [details](DETAILS.md#or-the-coder-half-the-experts-for-code).
-
-```
-START-HERE.bat --setup --family coder
-```
-
-### Swift 1.5
-
-**[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)** - a fine-tune by UkisAI that
-thinks much shorter before answering, so you get the answer sooner, with about the same quality. Same speed per
-token, and about the same RAM as the same size of the original. Its own license applies (see its page).
-More: [details](DETAILS.md#or-swift-15-a-fine-tune-that-thinks-shorter).
-
-```
-START-HERE.bat --setup --family swift --model IQ2_XS
-```
-
-<a id="unsloth-ud-iq4_xs"></a><a id="unsloth-ud-q4_k_xl-experimental"></a>
-
-### Unsloth's files: UD-IQ4_XS to Q8_0
-
-The fourth version in setup's menu (`--family unsloth`) is **Unsloth's quantizations** of the same model, from ~4 to 8
-bits. They keep the original's experts at more bits than the 2-3-bit sizes above, so they need more RAM. Setup keeps
-every expert in RAM where they and 16 GB more fit (the fastest way); with less RAM it keeps as many as fit and reads
-the rest from the SSD while it answers (much slower), and for the bigger files it asks first. Images are on by default
-on an NVIDIA card of 16 GB or more (and on AMD with the CPU encoder where the experts fit in RAM).
-
-| Size | Download | Experts | RAM for all of them in RAM | Same top token as Q8_0 | AMD R9700 (32 GB): story / code / 32K prompt |
-| --- | ---: | ---: | ---: | ---: | --- |
-| **UD-IQ4_XS** (setup's first) | 94 GB | 55 GiB | ~72 GB | 88.9% | - |
-| **UD-Q4_K_XL** | 111 GB | 72 GiB | ~88 GB | 93.1% | 63 / 87 tok/s / 1,110-1,320 tok/s |
-| **UD-Q5_K_XL** | 158 GB | 92 GiB | ~108 GB | 94.6% | 57-60 / 82 / 810-1,260 |
-| **UD-Q6_K_XL** | 169 GB | 102 GiB | ~118 GB | 94.6% | 54 / 76 / 1,020 |
-| **Q8_0** | 188 GB | 120 GiB | ~136 GB | 100% (the reference) | 53-57 / 66-74 / 1,230-1,300 |
-
-For comparison, IQ3_S on the same card: 75 / 95 tok/s, 87.7% the same top token as Q8_0. The quality numbers, the
-speed bound and NVIDIA/AMD/Intel details: [QUANTS.md](QUANTS.md); the files: [UD-Q4_K_XL](UNSLOTH_Q4.md),
-[UD-Q6_K_XL](UNSLOTH_Q6.md).
-
-```
-START-HERE.bat --setup --family unsloth --model UD-Q5_K_XL
-```
-
-### OrcaRouter Uncensored IQ3_XXS
-
-For **OrcaRouter's Flash-Next Uncensored IQ3_XXS**, see the [manual compatibility setup](ORCA.md). It needs an
-explicit packing conversion and is not an installer menu option.
-
-## Adding or switching models
-
-You can add another model any time with `SETUP.bat` (the same as `START-HERE.bat --setup`; on Linux
-`./setup.sh --setup`). Files another model shares are not downloaded again (the Coder uses the original's shard 2 and
-vision encoder). With more than one model installed, `START-HERE.bat` asks which one to start; `run-<model>.bat`
-(Linux: `run-<model>.sh`) starts one directly.

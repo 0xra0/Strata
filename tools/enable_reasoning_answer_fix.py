@@ -12,7 +12,7 @@ import time
 
 def enable(path, *, source=None):
     path = Path(path).resolve()
-    source = Path(source) if source else Path(__file__).resolve().parents[1] / 'serve/server.py'
+    source = Path(source) if source else Path(__file__).resolve().parents[1] / 'terminal/serve/server.py'
     code = source.read_bytes()
     if b'reasoning_close_retry v2' not in code or b'class IncompleteAnswer' not in code:
         raise ValueError('Extract the matching server update before enabling the answer fix')
